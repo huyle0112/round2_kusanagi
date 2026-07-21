@@ -15,8 +15,10 @@ from PIL import Image
 import torch
 import torchvision.transforms.functional as tf
 from utils.loss_utils import ssim
-# from lpipsPyTorch import lpips
-import lpips
+try:
+    import lpips
+except ImportError:
+    import lpipsPyTorch as lpips
 import json
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -96,7 +98,7 @@ def evaluate(model_paths):
 if __name__ == "__main__":
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
-    lpips_fn = lpips.LPIPS(net='vgg').to(device)
+    lpips_fn = lpips.LPIPS('vgg').to(device)
 
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")

@@ -30,8 +30,10 @@ import shutil, pathlib
 from pathlib import Path
 from PIL import Image
 import torchvision.transforms.functional as tf
-# from lpipsPyTorch import lpips
-import lpips
+try:
+    import lpips
+except ImportError:
+    import lpipsPyTorch as lpips
 from random import randint
 from utils.loss_utils import l1_loss, charbonnier_loss, freq_loss, ssim
 from gaussian_renderer import prefilter_voxel, render, network_gui
@@ -93,7 +95,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     # Initialize LPIPS model if needed (cached, frozen)
     if opt.lambda_lpips > 0 and lpips_fn is None:
-        lpips_fn = lpips.LPIPS(net=opt.lpips_net).to('cuda')
+        lpips_fn = lpips.LPIPS(opt.lpips_net).to('cuda')
         lpips_fn.eval()
         lpips_fn.requires_grad_(False)
         if logger:
@@ -400,7 +402,7 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
     global lpips_fn
     # Ensure LPIPS model exists for evaluation metrics
     if lpips_fn is None:
-        lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
+        lpips_fn = lpips.LPIPS('vgg').to('cuda')
         lpips_fn.eval()
         lpips_fn.requires_grad_(False)
 
