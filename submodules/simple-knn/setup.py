@@ -9,7 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from setuptools import setup
+from setuptools import setup, find_packages
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
 
@@ -20,6 +20,7 @@ if os.name == 'nt':
 
 setup(
     name="simple_knn",
+    packages=find_packages(),
     ext_modules=[
         CUDAExtension(
             name="simple_knn._C",
