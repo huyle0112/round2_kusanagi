@@ -190,17 +190,19 @@ def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
     if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        print("Converting point3d.bin to in-memory PointCloud...")
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)
         except:
             xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
-    # try:
-    print(f'start fetching data from ply file')
-    pcd = fetchPly(ply_path)
-    # except:
-    #     pcd = None
+        try:
+            storePly(ply_path, xyz, rgb)
+        except Exception as e:
+            print(f"Notice: Read-only dataset, skipped writing {ply_path}.")
+        pcd = BasicPointCloud(points=xyz, colors=rgb / 255.0, normals=np.zeros_like(xyz))
+    else:
+        print(f'start fetching data from ply file')
+        pcd = fetchPly(ply_path)
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
@@ -474,15 +476,19 @@ def readColmapSceneInfoWithCSV(path, images, eval, lod, llffhold=8):
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
     if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        print("Converting point3d.bin to in-memory PointCloud...")
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)
         except:
             xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
-    
-    print(f'start fetching data from ply file')
-    pcd = fetchPly(ply_path)
+        try:
+            storePly(ply_path, xyz, rgb)
+        except Exception as e:
+            print(f"Notice: Read-only dataset, skipped writing {ply_path}.")
+        pcd = BasicPointCloud(points=xyz, colors=rgb / 255.0, normals=np.zeros_like(xyz))
+    else:
+        print(f'start fetching data from ply file')
+        pcd = fetchPly(ply_path)
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

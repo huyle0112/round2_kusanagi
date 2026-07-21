@@ -59,12 +59,16 @@ class Scene:
         self.gaussians.set_appearance(len(scene_info.train_cameras))
         
         if not self.loaded_iter:
-            if ply_path is not None:
-                with open(ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
+            target_input_ply = os.path.join(self.model_path, "input.ply")
+            if ply_path is not None and os.path.exists(ply_path):
+                with open(ply_path, 'rb') as src_file, open(target_input_ply, 'wb') as dest_file:
                     dest_file.write(src_file.read())
-            else:
-                with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
+            elif os.path.exists(scene_info.ply_path):
+                with open(scene_info.ply_path, 'rb') as src_file, open(target_input_ply, 'wb') as dest_file:
                     dest_file.write(src_file.read())
+            elif scene_info.point_cloud is not None:
+                from scene.dataset_readers import storePly
+                storePly(target_input_ply, scene_info.point_cloud.points, scene_info.point_cloud.colors * 255)
             json_cams = []
             camlist = []
             if scene_info.test_cameras:
