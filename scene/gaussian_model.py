@@ -12,8 +12,14 @@
 import torch
 from functools import reduce
 import numpy as np
-from torch_scatter import scatter_max
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
+def scatter_max(src, index, dim=0):
+    num_indices = index.max().item() + 1 if index.numel() > 0 else 0
+    out_shape = list(src.shape)
+    out_shape[dim] = num_indices
+    out = torch.full(out_shape, float('-inf'), dtype=src.dtype, device=src.device)
+    out.scatter_reduce_(dim, index, src, reduce='amax', include_self=False)
+    return out, None
 from torch import nn
 import os
 from utils.system_utils import mkdir_p
