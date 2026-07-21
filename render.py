@@ -54,9 +54,13 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
         rendering = render_pkg["render"]
         gt = view.original_image[0:3, :, :]
-        name_list.append('{0:05d}'.format(idx) + ".png")
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        
+        # Determine filename: use original filename with extension if present (from CSV)
+        out_name = view.image_name if '.' in view.image_name else '{0:05d}.png'.format(idx)
+        name_list.append(out_name)
+        
+        torchvision.utils.save_image(rendering, os.path.join(render_path, out_name))
+        torchvision.utils.save_image(gt, os.path.join(gts_path, out_name))
 
     t = np.array(t_list[5:])
     fps = 1.0 / t.mean()

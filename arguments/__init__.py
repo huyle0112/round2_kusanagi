@@ -152,6 +152,13 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
+        # Enhanced loss parameters
+        self.use_charbonnier = False
+        self.lambda_lpips = 0.0
+        self.lambda_freq = 0.0
+        self.lpips_net = "vgg"
+        self.lpips_start_iter = 1000
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

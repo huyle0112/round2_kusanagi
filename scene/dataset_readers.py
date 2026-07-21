@@ -107,6 +107,9 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         # print(f'FovX: {FovX}, FovY: {FovY}')
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
+        if not os.path.exists(image_path):
+            # Skip if the image file does not exist in the training folder
+            continue
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
 
@@ -329,7 +332,167 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png", ply_pa
                            ply_path=ply_path)
     return scene_info
 
+def readCamerasFromCSV(csv_path, image_dir=None):
+    """Read test camera poses from test_poses.csv file.
+    
+    CSV format: image_name, qw, qx, qy, qz, tx, ty, tz, fx, fy, cx, cy, width, height
+    
+    Args:
+        csv_path: Path to the test_poses.csv file.
+        image_dir: Optional path to directory containing test images. 
+                   If None or image not found, creates a dummy white image.
+    
+    Returns:
+        List of CameraInfo objects.
+    """
+    import csv
+
+    cam_infos = []
+    with open(csv_path, 'r') as f:
+        reader = csv.DictReader(f)
+        for idx, row in enumerate(reader):
+            # Parse quaternion (COLMAP convention: w, x, y, z)
+            qvec = np.array([
+                float(row['qw']), float(row['qx']),
+                float(row['qy']), float(row['qz'])
+            ])
+            
+            # Parse translation
+            tvec = np.array([float(row['tx']), float(row['ty']), float(row['tz'])])
+            
+            # Parse intrinsics
+            fx = float(row['fx'])
+            fy = float(row['fy'])
+            width = int(row['width'])
+            height = int(row['height'])
+            
+            # Convert quaternion to rotation matrix (transposed, same as COLMAP pipeline)
+            R = np.transpose(qvec2rotmat(qvec))
+            T = tvec
+            
+            # Convert focal lengths to field of view
+            FovX = focal2fov(fx, width)
+            FovY = focal2fov(fy, height)
+            
+            # Image name
+            image_name = row['image_name'].strip()
+            
+            # Try to load GT image if available, otherwise create dummy
+            image = None
+            image_path = ""
+            if image_dir is not None:
+                candidate = os.path.join(image_dir, image_name)
+                if os.path.exists(candidate):
+                    image = Image.open(candidate)
+                    image_path = candidate
+            
+            if image is None:
+                # Create dummy white image (no GT for test set)
+                image = Image.new("RGB", (width, height), (255, 255, 255))
+                image_path = ""
+            
+            cam_info = CameraInfo(
+                uid=idx,
+                R=R, T=T,
+                FovY=FovY, FovX=FovX,
+                image=image,
+                image_path=image_path,
+                image_name=image_name,
+                width=width, height=height
+            )
+            cam_infos.append(cam_info)
+    
+    print(f"Loaded {len(cam_infos)} test cameras from {csv_path}")
+    return cam_infos
+
+
+def readColmapSceneInfoWithCSV(path, images, eval, lod, llffhold=8):
+    """Extended version of readColmapSceneInfo that loads test cameras from test_poses.csv.
+    
+    Falls back to standard COLMAP test split if no CSV file is found.
+    """
+    # Read COLMAP data for train cameras
+    try:
+        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
+        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
+        cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
+        cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
+    except:
+        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
+        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
+        cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
+        cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+
+    reading_dir = "images" if images is None else images
+    cam_infos_unsorted = readColmapCameras(
+        cam_extrinsics=cam_extrinsics,
+        cam_intrinsics=cam_intrinsics,
+        images_folder=os.path.join(path, reading_dir)
+    )
+    cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
+    
+    # Check for test_poses.csv  
+    csv_path = os.path.join(path, "test", "test_poses.csv")
+    if not os.path.exists(csv_path):
+        # Try parent directory pattern (data might be in train/ subfolder)
+        parent = os.path.dirname(path)
+        csv_path_alt = os.path.join(parent, "test", "test_poses.csv")
+        if os.path.exists(csv_path_alt):
+            csv_path = csv_path_alt
+    
+    if os.path.exists(csv_path):
+        print(f"Found test_poses.csv at {csv_path}")
+        # All COLMAP cameras are training cameras
+        train_cam_infos = cam_infos
+        
+        # Load test cameras from CSV
+        test_image_dir = os.path.join(os.path.dirname(csv_path), "images")
+        if not os.path.exists(test_image_dir):
+            test_image_dir = None
+        test_cam_infos = readCamerasFromCSV(csv_path, image_dir=test_image_dir)
+    else:
+        # Fallback to standard COLMAP split
+        print("No test_poses.csv found, using standard COLMAP eval split")
+        if eval:
+            if lod > 0:
+                if lod < 50:
+                    train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx > lod]
+                    test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx <= lod]
+                else:
+                    train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx <= lod]
+                    test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx > lod]
+            else:
+                train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+                test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+        else:
+            train_cam_infos = cam_infos
+            test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "sparse/0/points3D.ply")
+    bin_path = os.path.join(path, "sparse/0/points3D.bin")
+    txt_path = os.path.join(path, "sparse/0/points3D.txt")
+    if not os.path.exists(ply_path):
+        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        try:
+            xyz, rgb, _ = read_points3D_binary(bin_path)
+        except:
+            xyz, rgb, _ = read_points3D_text(txt_path)
+        storePly(ply_path, xyz, rgb)
+    
+    print(f'start fetching data from ply file')
+    pcd = fetchPly(ply_path)
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
+
 sceneLoadTypeCallbacks = {
-    "Colmap": readColmapSceneInfo,
+    "Colmap": readColmapSceneInfoWithCSV,
     "Blender": readNerfSyntheticInfo,
 }

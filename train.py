@@ -33,7 +33,7 @@ import torchvision.transforms.functional as tf
 # from lpipsPyTorch import lpips
 import lpips
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, charbonnier_loss, freq_loss, ssim
 from gaussian_renderer import prefilter_voxel, render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -45,7 +45,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 
 # torch.set_num_threads(32)
-lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
+lpips_fn = None  # Lazy init inside training() to respect --lpips_net arg
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -80,6 +80,7 @@ def saveRuntimeCode(dst: str) -> None:
 
 
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
+    global lpips_fn
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
@@ -89,6 +90,14 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    # Initialize LPIPS model if needed (cached, frozen)
+    if opt.lambda_lpips > 0 and lpips_fn is None:
+        lpips_fn = lpips.LPIPS(net=opt.lpips_net).to('cuda')
+        lpips_fn.eval()
+        lpips_fn.requires_grad_(False)
+        if logger:
+            logger.info(f"LPIPS model initialized with {opt.lpips_net} backbone")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -138,11 +147,26 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
+
+        # Pixel loss: Charbonnier (smooth L1) or standard L1
+        if opt.use_charbonnier:
+            Ll1 = charbonnier_loss(image, gt_image)
+        else:
+            Ll1 = l1_loss(image, gt_image)
 
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+
+        # LPIPS loss (delayed start for stable training)
+        if opt.lambda_lpips > 0 and iteration >= opt.lpips_start_iter:
+            lpips_value = lpips_fn(image.unsqueeze(0), gt_image.unsqueeze(0)).mean()
+            loss = loss + opt.lambda_lpips * lpips_value
+
+        # Frequency loss (FFT-based)
+        if opt.lambda_freq > 0:
+            freq_value = freq_loss(image, gt_image)
+            loss = loss + opt.lambda_freq * freq_value
 
         loss.backward()
         
@@ -153,7 +177,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                postfix = {"Loss": f"{ema_loss_for_log:.{7}f}"}
+                if opt.lambda_lpips > 0 and iteration >= opt.lpips_start_iter:
+                    postfix["LPIPS"] = f"{lpips_value.item():.4f}"
+                if opt.lambda_freq > 0:
+                    postfix["Freq"] = f"{freq_value.item():.4f}"
+                progress_bar.set_postfix(postfix)
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -210,7 +239,7 @@ def prepare_output_and_logger(args):
 
 def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None):
     if tb_writer:
-        tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/l1_loss', Ll1.item(), iteration)
+        tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/pixel_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/iter_time', elapsed, iteration)
 
@@ -309,12 +338,14 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         # error maps
         errormap = (rendering - gt).abs()
 
-
-        name_list.append('{0:05d}'.format(idx) + ".png")
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(errormap, os.path.join(error_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
-        per_view_dict['{0:05d}'.format(idx) + ".png"] = visible_count.item()
+        # Determine filename: use original filename with extension if present (from CSV)
+        out_name = view.image_name if '.' in view.image_name else '{0:05d}.png'.format(idx)
+        name_list.append(out_name)
+        
+        torchvision.utils.save_image(rendering, os.path.join(render_path, out_name))
+        torchvision.utils.save_image(errormap, os.path.join(error_path, out_name))
+        torchvision.utils.save_image(gt, os.path.join(gts_path, out_name))
+        per_view_dict[out_name] = visible_count.item()
     
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
             json.dump(per_view_dict, fp, indent=True)
@@ -366,6 +397,12 @@ def readImages(renders_dir, gt_dir):
 
 
 def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, dataset_name=None, logger=None):
+    global lpips_fn
+    # Ensure LPIPS model exists for evaluation metrics
+    if lpips_fn is None:
+        lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
+        lpips_fn.eval()
+        lpips_fn.requires_grad_(False)
 
     full_dict = {}
     per_view_dict = {}

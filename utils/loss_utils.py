@@ -20,6 +20,16 @@ def l1_loss(network_output, gt):
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 
+def charbonnier_loss(network_output, gt, eps=1e-6):
+    """Smooth L1 — dùng trong Mip-NeRF 360 / Zip-NeRF."""
+    return torch.sqrt((network_output - gt) ** 2 + eps ** 2).mean()
+
+def freq_loss(network_output, gt):
+    """FFT-based frequency loss — match high-frequency details."""
+    pred_fft = torch.fft.rfft2(network_output)
+    gt_fft = torch.fft.rfft2(gt)
+    return F.l1_loss(torch.abs(pred_fft), torch.abs(gt_fft))
+
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
     return gauss / gauss.sum()
