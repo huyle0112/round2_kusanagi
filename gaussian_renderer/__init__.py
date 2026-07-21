@@ -15,6 +15,23 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 
+def get_embedding_num_cameras(appearance_module):
+    if appearance_module is None:
+        return 0
+    if hasattr(appearance_module, 'in_dim'):
+        return appearance_module.in_dim
+    try:
+        if hasattr(appearance_module, 'embedding') and hasattr(appearance_module.embedding, 'weight'):
+            return appearance_module.embedding.weight.shape[0]
+    except Exception:
+        pass
+    try:
+        for param in appearance_module.parameters():
+            return param.shape[0]
+    except Exception:
+        pass
+    return 999999
+
 def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False):
     ## view frustum filtering for acceleration    
     if visible_mask is None:
@@ -50,7 +67,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
     if pc.appearance_dim > 0:
         # Clamp to avoid index out of bounds for test poses
-        cam_idx = min(viewpoint_camera.uid, pc.embedding_appearance.in_dim - 1)
+        num_cams = get_embedding_num_cameras(pc.embedding_appearance)
+        cam_idx = min(viewpoint_camera.uid, num_cams - 1) if num_cams > 0 else viewpoint_camera.uid
         camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * cam_idx
         appearance = pc.get_appearance(camera_indicies)
 
