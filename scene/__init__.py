@@ -41,13 +41,20 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
+        # Auto-detect if user passed dataset root containing 'train' subfolder
+        if not os.path.exists(os.path.join(args.source_path, "sparse")) and not os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
+            train_subpath = os.path.join(args.source_path, "train")
+            if os.path.exists(os.path.join(train_subpath, "sparse")) or os.path.exists(os.path.join(train_subpath, "transforms_train.json")):
+                print(f"Auto-detected dataset path in subfolder: {train_subpath}")
+                args.source_path = train_subpath
+
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.lod)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, ply_path=ply_path)
         else:
-            assert False, "Could not recognize scene type!"
+            assert False, f"Could not recognize scene type in '{args.source_path}'! Please check that the path contains 'sparse' folder or 'transforms_train.json'."
 
         self.gaussians.set_appearance(len(scene_info.train_cameras))
         
