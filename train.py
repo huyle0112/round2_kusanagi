@@ -30,10 +30,8 @@ import shutil, pathlib
 from pathlib import Path
 from PIL import Image
 import torchvision.transforms.functional as tf
-try:
-    import lpips
-except ImportError:
-    import lpipsPyTorch as lpips
+
+import lpipsPyTorch as lpips
 from random import randint
 from utils.loss_utils import l1_loss, charbonnier_loss, freq_loss, ssim
 from gaussian_renderer import prefilter_voxel, render, network_gui
