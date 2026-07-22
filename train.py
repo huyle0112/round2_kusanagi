@@ -26,12 +26,12 @@ import json
 import wandb
 import time
 from os import makedirs
-import shutil, pathlib
 from pathlib import Path
 from PIL import Image
 import torchvision.transforms.functional as tf
 
 import lpipsPyTorch as lpips
+import random
 from random import randint
 from utils.loss_utils import l1_loss, charbonnier_loss, freq_loss, ssim
 from gaussian_renderer import prefilter_voxel, render, network_gui
@@ -54,30 +54,6 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
     print("not found tf board")
-
-def saveRuntimeCode(dst: str) -> None:
-    additionalIgnorePatterns = ['.git', '.gitignore']
-    ignorePatterns = set()
-    ROOT = '.'
-    with open(os.path.join(ROOT, '.gitignore')) as gitIgnoreFile:
-        for line in gitIgnoreFile:
-            if not line.startswith('#'):
-                if line.endswith('\n'):
-                    line = line[:-1]
-                if line.endswith('/'):
-                    line = line[:-1]
-                ignorePatterns.add(line)
-    ignorePatterns = list(ignorePatterns)
-    for additionalPattern in additionalIgnorePatterns:
-        ignorePatterns.append(additionalPattern)
-
-    log_dir = pathlib.Path(__file__).parent.resolve()
-
-
-    shutil.copytree(log_dir, dst, ignore=shutil.ignore_patterns(*ignorePatterns))
-    
-    print('Backup Finished!')
-
 
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
     global lpips_fn
@@ -251,8 +227,10 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
     if iteration in testing_iterations:
         scene.gaussians.eval()
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        train_cameras = scene.getTrainCameras()
+        sample_size = min(20, len(train_cameras))
+        validation_cameras = random.Random(iteration).sample(train_cameras, sample_size)
+        validation_configs = ({'name': 'train', 'cameras': validation_cameras},)
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
@@ -530,11 +508,6 @@ if __name__ == "__main__":
 
     
 
-    try:
-        saveRuntimeCode(os.path.join(args.model_path, 'backup'))
-    except:
-        logger.info(f'save code failed~')
-        
     dataset = args.source_path.split('/')[-1]
     exp_name = args.model_path.split('/')[-2]
     
@@ -570,12 +543,4 @@ if __name__ == "__main__":
     # All done
     logger.info("\nTraining complete.")
 
-    # rendering
-    logger.info(f'\nStarting Rendering~')
-    visible_count = render_sets(lp.extract(args), -1, pp.extract(args), wandb=wandb, logger=logger)
-    logger.info("\nRendering complete.")
-
-    # calc metrics
-    logger.info("\n Starting evaluation...")
-    evaluate(args.model_path, visible_count=visible_count, wandb=wandb, logger=logger)
-    logger.info("\nEvaluating complete.")
+    logger.info("Run render.py and metrics.py separately to render and evaluate the trained model.")

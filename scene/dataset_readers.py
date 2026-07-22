@@ -442,7 +442,7 @@ def readColmapSceneInfoWithCSV(path, images, eval, lod, llffhold=8):
         if os.path.exists(csv_path_alt):
             csv_path = csv_path_alt
     
-    if os.path.exists(csv_path):
+    if os.path.exists(csv_path) and eval:
         print(f"Found test_poses.csv at {csv_path}")
         # All COLMAP cameras are training cameras
         train_cam_infos = cam_infos
@@ -452,6 +452,13 @@ def readColmapSceneInfoWithCSV(path, images, eval, lod, llffhold=8):
         if not os.path.exists(test_image_dir):
             test_image_dir = None
         test_cam_infos = readCamerasFromCSV(csv_path, image_dir=test_image_dir)
+    elif os.path.exists(csv_path):
+        # Training mode: the competition test set has poses but no ground-truth
+        # images. Keep every existing COLMAP image for training and do not create
+        # placeholder test cameras/tensors.
+        print("Found test_poses.csv, but test cameras are disabled during training (use --eval to load them)")
+        train_cam_infos = cam_infos
+        test_cam_infos = []
     else:
         # Fallback to standard COLMAP split
         print("No test_poses.csv found, using standard COLMAP eval split")

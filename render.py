@@ -25,18 +25,19 @@ import json
 import time
 from gaussian_renderer import render, prefilter_voxel
 import torchvision
+import random
 from tqdm import tqdm
 from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, save_gt=True):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     if not os.path.exists(render_path):
         os.makedirs(render_path)
-    if not os.path.exists(gts_path):
+    if save_gt and not os.path.exists(gts_path):
         os.makedirs(gts_path)
 
     name_list = []
@@ -53,14 +54,14 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         t_list.append(t1-t0)
 
         rendering = render_pkg["render"]
-        gt = view.original_image[0:3, :, :]
-        
         # Determine filename: use original filename with extension if present (from CSV)
         out_name = view.image_name if '.' in view.image_name else '{0:05d}.png'.format(idx)
         name_list.append(out_name)
         
         torchvision.utils.save_image(rendering, os.path.join(render_path, out_name))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, out_name))
+        if save_gt:
+            gt = view.original_image[0:3, :, :]
+            torchvision.utils.save_image(gt, os.path.join(gts_path, out_name))
 
     t = np.array(t_list[5:])
     fps = 1.0 / t.mean()
@@ -69,7 +70,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
             json.dump(per_view_dict, fp, indent=True)      
      
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, train_views : int, seed : int):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
@@ -83,10 +84,13 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             os.makedirs(dataset.model_path)
         
         if not skip_train:
-             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
+             train_cameras = scene.getTrainCameras()
+             if train_views > 0 and train_views < len(train_cameras):
+                 train_cameras = random.Random(seed).sample(train_cameras, train_views)
+             render_set(dataset.model_path, "train", scene.loaded_iter, train_cameras, gaussians, pipeline, background, save_gt=True)
 
         if not skip_test:
-             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
+             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, save_gt=False)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -96,6 +100,9 @@ if __name__ == "__main__":
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
+    parser.add_argument("--train_views", default=0, type=int,
+                        help="Randomly render this many training views (0 renders all)")
+    parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--quiet", action="store_true")
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
@@ -103,4 +110,4 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test)
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.train_views, args.seed)
