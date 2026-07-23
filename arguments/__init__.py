@@ -63,6 +63,11 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = False
         self.lod = 0
+        # Optional deterministic holdout from the real COLMAP images. This is
+        # independent of the competition test_poses.csv and is intended for
+        # validation/ablation runs with ground truth.
+        self.validation_ratio = 0.0
+        self.validation_seed = 42
 
         # Per-camera appearance embeddings are useful for uncontrolled exposure,
         # but test-pose UIDs do not identify matching train cameras in this dataset.

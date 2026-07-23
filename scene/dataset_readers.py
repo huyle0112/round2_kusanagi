@@ -11,6 +11,7 @@
 
 import os
 import glob
+import random
 import sys
 from PIL import Image
 from tqdm import tqdm
@@ -408,7 +409,39 @@ def readCamerasFromCSV(csv_path, image_dir=None):
     return cam_infos
 
 
-def readColmapSceneInfoWithCSV(path, images, eval, lod, llffhold=8):
+def split_train_validation_cameras(cam_infos, validation_ratio=0.2, seed=42):
+    """Deterministically split real cameras while preserving their sorted order."""
+    if not 0.0 < validation_ratio < 1.0:
+        raise ValueError(
+            f"validation_ratio must be between 0 and 1, got {validation_ratio}"
+        )
+    if len(cam_infos) < 2:
+        raise ValueError("At least two cameras are required for a validation split")
+
+    validation_count = int(round(len(cam_infos) * validation_ratio))
+    validation_count = min(max(validation_count, 1), len(cam_infos) - 1)
+    rng = random.Random(seed)
+    validation_indices = set(rng.sample(range(len(cam_infos)), validation_count))
+    train_cameras = [
+        camera for index, camera in enumerate(cam_infos)
+        if index not in validation_indices
+    ]
+    validation_cameras = [
+        camera for index, camera in enumerate(cam_infos)
+        if index in validation_indices
+    ]
+    return train_cameras, validation_cameras
+
+
+def readColmapSceneInfoWithCSV(
+    path,
+    images,
+    eval,
+    lod,
+    llffhold=8,
+    validation_ratio=0.0,
+    validation_seed=42,
+):
     """Extended version of readColmapSceneInfo that loads test cameras from test_poses.csv.
     
     Falls back to standard COLMAP test split if no CSV file is found.
@@ -442,7 +475,19 @@ def readColmapSceneInfoWithCSV(path, images, eval, lod, llffhold=8):
         if os.path.exists(csv_path_alt):
             csv_path = csv_path_alt
     
-    if os.path.exists(csv_path) and eval:
+    if validation_ratio > 0.0:
+        train_cam_infos, test_cam_infos = split_train_validation_cameras(
+            cam_infos,
+            validation_ratio=validation_ratio,
+            seed=validation_seed,
+        )
+        print(
+            "Validation holdout enabled: "
+            f"train={len(train_cam_infos)}, validation={len(test_cam_infos)}, "
+            f"ratio={validation_ratio:.3f}, seed={validation_seed}. "
+            "Ignoring test_poses.csv for this run."
+        )
+    elif os.path.exists(csv_path) and eval:
         print(f"Found test_poses.csv at {csv_path}")
         # All COLMAP cameras are training cameras
         train_cam_infos = cam_infos

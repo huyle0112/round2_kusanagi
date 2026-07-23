@@ -90,7 +90,19 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
              render_set(dataset.model_path, "train", scene.loaded_iter, train_cameras, gaussians, pipeline, background, save_gt=True)
 
         if not skip_test:
-             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, save_gt=False)
+             # Competition CSV poses have no GT, but an explicit validation
+             # holdout is made from real COLMAP images and must save its GT.
+             save_test_gt = getattr(dataset, "validation_ratio", 0.0) > 0.0
+             render_set(
+                 dataset.model_path,
+                 "test",
+                 scene.loaded_iter,
+                 scene.getTestCameras(),
+                 gaussians,
+                 pipeline,
+                 background,
+                 save_gt=save_test_gt,
+             )
 
 if __name__ == "__main__":
     # Set up command line argument parser

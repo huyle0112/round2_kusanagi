@@ -180,6 +180,17 @@ shape and cannot be resumed with `--appearance_dim 0`. Start a new output
 directory when changing this setting. The Kaggle notebook already uses
 `output_gaussianpro_noappearance` to avoid accidentally reusing an old model.
 
+For a deterministic ground-truth A/B validation split, pass the same options
+to both training and rendering:
+
+```bash
+--validation_ratio 0.2 --validation_seed 42
+```
+
+The loader then trains on 80% of the real COLMAP cameras, exposes the remaining
+20% as the test split, and ignores the ground-truth-free `test_poses.csv` for
+that run.
+
 
 This script will store the log (with running-time code) into ```outputs/dataset_name/scene_name/exp_name/cur_time``` automatically.
 

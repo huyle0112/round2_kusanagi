@@ -153,12 +153,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
 
         gaussianpro_flatten = None
+        gaussianpro_flatness_ratio = None
         gaussianpro_normal = None
         gaussianpro_depth_smooth = None
         gaussianpro_valid_ratio = None
         if gaussianpro_active:
             # GaussianPro's planar prior: one covariance axis should become thin.
-            gaussianpro_flatten = scaling.min(dim=1).values.mean()
+            sorted_scaling = scaling.sort(dim=1).values
+            gaussianpro_flatten = sorted_scaling[:, 0].mean()
+            gaussianpro_flatness_ratio = (
+                sorted_scaling[:, 0] / sorted_scaling[:, 1].clamp_min(1e-8)
+            ).mean()
             loss = loss + opt.lambda_gaussianpro_flatten * gaussianpro_flatten
 
         if gaussianpro_geometry_step:
@@ -207,7 +212,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 if opt.lambda_freq > 0:
                     postfix["Freq"] = f"{freq_value.item():.4f}"
                 if gaussianpro_flatten is not None:
-                    postfix["GP-flat"] = f"{gaussianpro_flatten.item():.5f}"
+                    postfix["GP-flat"] = f"{gaussianpro_flatten.item():.2e}"
+                    postfix["GP-ratio"] = f"{gaussianpro_flatness_ratio.item():.3f}"
                 if gaussianpro_normal is not None:
                     postfix["GP-normal"] = f"{gaussianpro_normal.item():.4f}"
                 progress_bar.set_postfix(postfix)
@@ -216,6 +222,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     tb_writer.add_scalar(
                         f"{dataset_name}/gaussianpro/flatten",
                         gaussianpro_flatten.item(),
+                        iteration,
+                    )
+                    tb_writer.add_scalar(
+                        f"{dataset_name}/gaussianpro/flatness_ratio",
+                        gaussianpro_flatness_ratio.item(),
                         iteration,
                     )
                 if tb_writer and gaussianpro_normal is not None:
