@@ -17,3 +17,5 @@ screenshots
 *.so
 scenes/
 data/
+pose/
+fsub/

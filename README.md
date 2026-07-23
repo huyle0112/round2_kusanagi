@@ -147,6 +147,39 @@ bash ./single_train.sh
 
 > For these public datasets, the configurations of 'voxel_size' and 'update_init_factor' can refer to the above batch training script. 
 
+### No-appearance + GaussianPro geometry regularisation
+
+Per-camera appearance embeddings are disabled by default (`--appearance_dim 0`).
+This is important for test-pose CSVs whose camera UIDs do not correspond to
+training-camera UIDs.
+
+The repository also includes an anchor-compatible GaussianPro mode:
+
+```bash
+python train.py -s <scene> -m <output> --appearance_dim 0 \
+  --use_gaussianpro \
+  --gaussianpro_start_iter 1000 \
+  --gaussianpro_interval 4 \
+  --gaussianpro_downsample 2
+```
+
+This mode adds Gaussian flattening, camera-depth/normal consistency, and
+edge-aware inverse-depth smoothness. Geometry gradients flow through the
+existing Scaffold-GS screen-space statistics and therefore guide anchor
+growth. The extra geometry passes are downsampled and run every four
+iterations by default; RGB training and final rendering remain full
+resolution.
+
+This is the part of GaussianPro that can be applied safely to unordered
+Scaffold-GS camera sets. The original GaussianPro PatchMatch propagation is
+not enabled: it assumes time-ordered, overlapping neighbouring frames and a
+separate CUDA propagation extension.
+
+Models trained with appearance embeddings have a different colour-MLP input
+shape and cannot be resumed with `--appearance_dim 0`. Start a new output
+directory when changing this setting. The Kaggle notebook already uses
+`output_gaussianpro_noappearance` to avoid accidentally reusing an old model.
+
 
 This script will store the log (with running-time code) into ```outputs/dataset_name/scene_name/exp_name/cur_time``` automatically.
 

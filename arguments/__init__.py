@@ -64,7 +64,10 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.lod = 0
 
-        self.appearance_dim = 32
+        # Per-camera appearance embeddings are useful for uncontrolled exposure,
+        # but test-pose UIDs do not identify matching train cameras in this dataset.
+        # Keep them disabled by default so colour is predicted from geometry/view only.
+        self.appearance_dim = 0
         self.lowpoly = False
         self.ds = 1
         self.ratio = 1 # sampling the input point cloud
@@ -158,6 +161,20 @@ class OptimizationParams(ParamGroup):
         self.lambda_freq = 0.0
         self.lpips_net = "vgg"
         self.lpips_start_iter = 1000
+
+        # GaussianPro-inspired geometry regularisation for Scaffold-GS.
+        # The expensive depth/normal passes run at reduced resolution and only
+        # every N iterations. The flatten loss is cheap and runs every iteration
+        # after gaussianpro_start_iter.
+        self.use_gaussianpro = False
+        self.gaussianpro_start_iter = 1000
+        self.gaussianpro_interval = 4
+        self.gaussianpro_downsample = 2
+        self.gaussianpro_opacity_threshold = 0.5
+        self.gaussianpro_edge_weight = 10.0
+        self.lambda_gaussianpro_flatten = 10.0
+        self.lambda_gaussianpro_normal = 0.05
+        self.lambda_gaussianpro_depth_smooth = 0.01
 
         super().__init__(parser, "Optimization Parameters")
 

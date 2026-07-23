@@ -34,6 +34,7 @@ import lpipsPyTorch as lpips
 import random
 from random import randint
 from utils.loss_utils import l1_loss, charbonnier_loss, freq_loss, ssim
+from utils.gaussianpro_utils import gaussianpro_geometry_loss
 from gaussian_renderer import prefilter_voxel, render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -116,9 +117,26 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         if (iteration - 1) == debug_from:
             pipe.debug = True
         
+        gaussianpro_active = opt.use_gaussianpro and iteration >= opt.gaussianpro_start_iter
+        gaussianpro_geometry_step = (
+            gaussianpro_active
+            and iteration % max(1, opt.gaussianpro_interval) == 0
+        )
+
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
+        render_pkg = render(
+            viewpoint_cam,
+            gaussians,
+            pipe,
+            background,
+            visible_mask=voxel_visible_mask,
+            retain_grad=retain_grad,
+            return_depth=gaussianpro_geometry_step,
+            return_normal=gaussianpro_geometry_step,
+            return_opacity=gaussianpro_geometry_step,
+            geometry_downsample=opt.gaussianpro_downsample,
+        )
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
@@ -133,6 +151,36 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+
+        gaussianpro_flatten = None
+        gaussianpro_normal = None
+        gaussianpro_depth_smooth = None
+        gaussianpro_valid_ratio = None
+        if gaussianpro_active:
+            # GaussianPro's planar prior: one covariance axis should become thin.
+            gaussianpro_flatten = scaling.min(dim=1).values.mean()
+            loss = loss + opt.lambda_gaussianpro_flatten * gaussianpro_flatten
+
+        if gaussianpro_geometry_step:
+            (
+                gaussianpro_normal,
+                gaussianpro_depth_smooth,
+                gaussianpro_valid_ratio,
+            ) = gaussianpro_geometry_loss(
+                render_pkg["render_depth"],
+                render_pkg["render_normal"],
+                render_pkg["render_opacity"],
+                gt_image,
+                viewpoint_cam.FoVx,
+                viewpoint_cam.FoVy,
+                opacity_threshold=opt.gaussianpro_opacity_threshold,
+                edge_weight=opt.gaussianpro_edge_weight,
+            )
+            loss = (
+                loss
+                + opt.lambda_gaussianpro_normal * gaussianpro_normal
+                + opt.lambda_gaussianpro_depth_smooth * gaussianpro_depth_smooth
+            )
 
         # LPIPS loss (delayed start for stable training)
         if opt.lambda_lpips > 0 and iteration >= opt.lpips_start_iter:
@@ -158,8 +206,34 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     postfix["LPIPS"] = f"{lpips_value.item():.4f}"
                 if opt.lambda_freq > 0:
                     postfix["Freq"] = f"{freq_value.item():.4f}"
+                if gaussianpro_flatten is not None:
+                    postfix["GP-flat"] = f"{gaussianpro_flatten.item():.5f}"
+                if gaussianpro_normal is not None:
+                    postfix["GP-normal"] = f"{gaussianpro_normal.item():.4f}"
                 progress_bar.set_postfix(postfix)
                 progress_bar.update(10)
+                if tb_writer and gaussianpro_flatten is not None:
+                    tb_writer.add_scalar(
+                        f"{dataset_name}/gaussianpro/flatten",
+                        gaussianpro_flatten.item(),
+                        iteration,
+                    )
+                if tb_writer and gaussianpro_normal is not None:
+                    tb_writer.add_scalar(
+                        f"{dataset_name}/gaussianpro/normal",
+                        gaussianpro_normal.item(),
+                        iteration,
+                    )
+                    tb_writer.add_scalar(
+                        f"{dataset_name}/gaussianpro/depth_smooth",
+                        gaussianpro_depth_smooth.item(),
+                        iteration,
+                    )
+                    tb_writer.add_scalar(
+                        f"{dataset_name}/gaussianpro/valid_ratio",
+                        gaussianpro_valid_ratio.item(),
+                        iteration,
+                    )
             if iteration == opt.iterations:
                 progress_bar.close()
 

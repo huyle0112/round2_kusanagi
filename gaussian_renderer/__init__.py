@@ -9,11 +9,13 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 import torch
+import torch.nn.functional as F
 from einops import repeat
 
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
+from utils.general_utils import build_rotation
 
 def get_embedding_num_cameras(appearance_module):
     if appearance_module is None:
@@ -129,7 +131,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         return xyz, color, opacity, scaling, rot
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
+           scaling_modifier=1.0, visible_mask=None, retain_grad=False,
+           return_depth=False, return_normal=False, return_opacity=False,
+           geometry_downsample=1):
     """
     Render the scene. 
     
@@ -183,10 +188,91 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scaling,
         rotations = rot,
         cov3D_precomp = None)
+
+    geometry_outputs = {}
+    if return_depth or return_normal or return_opacity:
+        geometry_downsample = max(1, int(geometry_downsample))
+        geometry_height = max(1, int(viewpoint_camera.image_height) // geometry_downsample)
+        geometry_width = max(1, int(viewpoint_camera.image_width) // geometry_downsample)
+        geometry_settings = GaussianRasterizationSettings(
+            image_height=geometry_height,
+            image_width=geometry_width,
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=torch.zeros_like(bg_color),
+            scale_modifier=scaling_modifier,
+            viewmatrix=viewpoint_camera.world_view_transform,
+            projmatrix=viewpoint_camera.full_proj_transform,
+            sh_degree=1,
+            campos=viewpoint_camera.camera_center,
+            prefiltered=False,
+            debug=pipe.debug
+        )
+        geometry_rasterizer = GaussianRasterizer(raster_settings=geometry_settings)
+
+        # Pack accumulated depth and alpha into one RGB raster pass:
+        # channel 0 = sum(T_i * alpha_i * z_i), channel 1 = sum(T_i * alpha_i).
+        if return_depth or return_opacity:
+            viewmatrix = viewpoint_camera.world_view_transform
+            camera_depth = (
+                (xyz * viewmatrix[:3, 2].unsqueeze(0)).sum(dim=-1, keepdim=True)
+                + viewmatrix[3, 2]
+            )
+            depth_alpha_features = torch.cat(
+                [camera_depth, torch.ones_like(camera_depth), torch.zeros_like(camera_depth)],
+                dim=-1
+            )
+            depth_alpha, _ = geometry_rasterizer(
+                means3D=xyz,
+                means2D=screenspace_points,
+                shs=None,
+                colors_precomp=depth_alpha_features,
+                opacities=opacity,
+                scales=scaling,
+                rotations=rot,
+                cov3D_precomp=None
+            )
+            rendered_opacity = depth_alpha[1:2].clamp(0.0, 1.0)
+            if return_opacity:
+                geometry_outputs["render_opacity"] = rendered_opacity
+            if return_depth:
+                valid_alpha = rendered_opacity > 1e-6
+                rendered_depth = depth_alpha[0:1] / rendered_opacity.clamp_min(1e-6)
+                geometry_outputs["render_depth"] = torch.where(
+                    valid_alpha, rendered_depth, torch.zeros_like(rendered_depth)
+                )
+
+        if return_normal:
+            rotation_matrices = build_rotation(rot)
+            min_axis = scaling.argmin(dim=-1)
+            gaussian_indices = torch.arange(xyz.shape[0], device=xyz.device)
+            normal_world = rotation_matrices[gaussian_indices, :, min_axis]
+
+            # A Gaussian plane has two equivalent normal directions. Orient it
+            # towards the current camera before blending.
+            camera_to_gaussian = xyz - viewpoint_camera.camera_center.unsqueeze(0)
+            facing_away = (normal_world * camera_to_gaussian).sum(dim=-1, keepdim=True) > 0
+            normal_world = torch.where(facing_away, -normal_world, normal_world)
+            normal_camera = normal_world @ viewpoint_camera.world_view_transform[:3, :3]
+            normal_camera = F.normalize(normal_camera, dim=-1, eps=1e-6)
+
+            rendered_normal, _ = geometry_rasterizer(
+                means3D=xyz,
+                means2D=screenspace_points,
+                shs=None,
+                colors_precomp=normal_camera,
+                opacities=opacity,
+                scales=scaling,
+                rotations=rot,
+                cov3D_precomp=None
+            )
+            geometry_outputs["render_normal"] = F.normalize(
+                rendered_normal, dim=0, eps=1e-6
+            )
     
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     if is_training:
-        return {"render": rendered_image,
+        result = {"render": rendered_image,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
@@ -194,12 +280,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "neural_opacity": neural_opacity,
                 "scaling": scaling,
                 }
+        result.update(geometry_outputs)
+        return result
     else:
-        return {"render": rendered_image,
+        result = {"render": rendered_image,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
                 }
+        result.update(geometry_outputs)
+        return result
 
 
 def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
