@@ -56,6 +56,9 @@ class Scene:
                 args.lod,
                 validation_ratio=getattr(args, "validation_ratio", 0.0),
                 validation_seed=getattr(args, "validation_seed", 42),
+                correct_radial_distortion=getattr(
+                    args, "correct_radial_distortion", False
+                ),
             )
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")

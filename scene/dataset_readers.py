@@ -44,6 +44,12 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    radial_k1: float
+    image_undistorted: bool
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -75,7 +81,50 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def get_colmap_intrinsics(intr):
+    if intr.model == "SIMPLE_PINHOLE":
+        fx = fy = float(intr.params[0])
+        cx, cy = map(float, intr.params[1:3])
+        radial_k1 = 0.0
+    elif intr.model == "SIMPLE_RADIAL":
+        fx = fy = float(intr.params[0])
+        cx, cy, radial_k1 = map(float, intr.params[1:4])
+    elif intr.model == "PINHOLE":
+        fx, fy, cx, cy = map(float, intr.params[:4])
+        radial_k1 = 0.0
+    else:
+        raise AssertionError(
+            "COLMAP camera model not handled: expected SIMPLE_PINHOLE, "
+            "SIMPLE_RADIAL, or PINHOLE"
+        )
+    return fx, fy, cx, cy, radial_k1
+
+
+def undistort_pil_image(image, fx, fy, cx, cy, radial_k1):
+    camera_matrix = np.array(
+        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    distortion = np.array(
+        [radial_k1, 0.0, 0.0, 0.0, 0.0],
+        dtype=np.float64,
+    )
+    undistorted = cv2.undistort(
+        np.asarray(image.convert("RGB")),
+        camera_matrix,
+        distortion,
+        None,
+        camera_matrix,
+    )
+    return Image.fromarray(undistorted, "RGB")
+
+
+def readColmapCameras(
+    cam_extrinsics,
+    cam_intrinsics,
+    images_folder,
+    correct_radial_distortion=False,
+):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -92,18 +141,9 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
-        # if intr.model=="SIMPLE_PINHOLE":
-        if intr.model=="SIMPLE_PINHOLE" or intr.model == "SIMPLE_RADIAL":
-            focal_length_x = intr.params[0]
-            FovY = focal2fov(focal_length_x, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model=="PINHOLE":
-            focal_length_x = intr.params[0]
-            focal_length_y = intr.params[1]
-            FovY = focal2fov(focal_length_y, height)
-            FovX = focal2fov(focal_length_x, width)
-        else:
-            assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+        fx, fy, cx, cy, radial_k1 = get_colmap_intrinsics(intr)
+        FovY = focal2fov(fy, height)
+        FovX = focal2fov(fx, width)
         
         # print(f'FovX: {FovX}, FovY: {FovY}')
 
@@ -113,13 +153,52 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
             continue
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
+        image_undistorted = (
+            correct_radial_distortion and abs(radial_k1) > 1e-12
+        )
+        if image_undistorted:
+            image = undistort_pil_image(
+                image, fx, fy, cx, cy, radial_k1
+            )
 
         # print(f'image: {image.size}')
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+        cam_info = CameraInfo(
+            uid=uid,
+            R=R,
+            T=T,
+            FovY=FovY,
+            FovX=FovX,
+            image=image,
+            image_path=image_path,
+            image_name=image_name,
+            width=width,
+            height=height,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            radial_k1=radial_k1,
+            image_undistorted=image_undistorted,
+        )
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
+    skipped_count = len(cam_extrinsics) - len(cam_infos)
+    print(
+        f"Loaded {len(cam_infos)}/{len(cam_extrinsics)} COLMAP cameras with "
+        f"matching image files (skipped {skipped_count} missing images)"
+    )
+    corrected_count = sum(camera.image_undistorted for camera in cam_infos)
+    if correct_radial_distortion:
+        radial_values = sorted({
+            round(camera.radial_k1, 12)
+            for camera in cam_infos
+            if abs(camera.radial_k1) > 1e-12
+        })
+        print(
+            f"Radial correction: undistorted {corrected_count} images, "
+            f"k1={radial_values or [0.0]}"
+        )
     return cam_infos
 
 def fetchPly(path):
@@ -150,7 +229,14 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
+def readColmapSceneInfo(
+    path,
+    images,
+    eval,
+    lod,
+    llffhold=8,
+    correct_radial_distortion=False,
+):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -163,7 +249,12 @@ def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    cam_infos_unsorted = readColmapCameras(
+        cam_extrinsics=cam_extrinsics,
+        cam_intrinsics=cam_intrinsics,
+        images_folder=os.path.join(path, reading_dir),
+        correct_radial_distortion=correct_radial_distortion,
+    )
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
@@ -292,8 +383,26 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 FovY = focal2fov(frame["fl_y"], image.size[1])
                 FovX = focal2fov(frame["fl_x"], image.size[0])
 
-            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+            fx = fov2focal(FovX, image.size[0])
+            fy = fov2focal(FovY, image.size[1])
+            cam_infos.append(CameraInfo(
+                uid=idx,
+                R=R,
+                T=T,
+                FovY=FovY,
+                FovX=FovX,
+                image=image,
+                image_path=image_path,
+                image_name=image_name,
+                width=image.size[0],
+                height=image.size[1],
+                fx=fx,
+                fy=fy,
+                cx=(image.size[0] - 1.0) * 0.5,
+                cy=(image.size[1] - 1.0) * 0.5,
+                radial_k1=0.0,
+                image_undistorted=False,
+            ))
             
             if is_debug and idx > 50:
                 break
@@ -335,7 +444,12 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png", ply_pa
                            ply_path=ply_path)
     return scene_info
 
-def readCamerasFromCSV(csv_path, image_dir=None):
+def readCamerasFromCSV(
+    csv_path,
+    image_dir=None,
+    radial_k1=0.0,
+    correct_radial_distortion=False,
+):
     """Read test camera poses from test_poses.csv file.
     
     CSV format: image_name, qw, qx, qy, qz, tx, ty, tz, fx, fy, cx, cy, width, height
@@ -366,6 +480,8 @@ def readCamerasFromCSV(csv_path, image_dir=None):
             # Parse intrinsics
             fx = float(row['fx'])
             fy = float(row['fy'])
+            cx = float(row['cx'])
+            cy = float(row['cy'])
             width = int(row['width'])
             height = int(row['height'])
             
@@ -393,6 +509,13 @@ def readCamerasFromCSV(csv_path, image_dir=None):
                 # Create dummy white image (no GT for test set)
                 image = Image.new("RGB", (width, height), (255, 255, 255))
                 image_path = ""
+            image_undistorted = (
+                correct_radial_distortion and abs(radial_k1) > 1e-12
+            )
+            if image_undistorted and image_path:
+                image = undistort_pil_image(
+                    image, fx, fy, cx, cy, radial_k1
+                )
             
             cam_info = CameraInfo(
                 uid=idx,
@@ -401,7 +524,14 @@ def readCamerasFromCSV(csv_path, image_dir=None):
                 image=image,
                 image_path=image_path,
                 image_name=image_name,
-                width=width, height=height
+                width=width,
+                height=height,
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
+                radial_k1=radial_k1,
+                image_undistorted=image_undistorted,
             )
             cam_infos.append(cam_info)
     
@@ -441,6 +571,7 @@ def readColmapSceneInfoWithCSV(
     llffhold=8,
     validation_ratio=0.0,
     validation_seed=42,
+    correct_radial_distortion=False,
 ):
     """Extended version of readColmapSceneInfo that loads test cameras from test_poses.csv.
     
@@ -462,7 +593,8 @@ def readColmapSceneInfoWithCSV(
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics,
         cam_intrinsics=cam_intrinsics,
-        images_folder=os.path.join(path, reading_dir)
+        images_folder=os.path.join(path, reading_dir),
+        correct_radial_distortion=correct_radial_distortion,
     )
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
     
@@ -496,7 +628,16 @@ def readColmapSceneInfoWithCSV(
         test_image_dir = os.path.join(os.path.dirname(csv_path), "images")
         if not os.path.exists(test_image_dir):
             test_image_dir = None
-        test_cam_infos = readCamerasFromCSV(csv_path, image_dir=test_image_dir)
+        reference_intrinsics = next(iter(cam_intrinsics.values()))
+        _, _, _, _, test_radial_k1 = get_colmap_intrinsics(
+            reference_intrinsics
+        )
+        test_cam_infos = readCamerasFromCSV(
+            csv_path,
+            image_dir=test_image_dir,
+            radial_k1=test_radial_k1,
+            correct_radial_distortion=correct_radial_distortion,
+        )
     elif os.path.exists(csv_path):
         # Training mode: the competition test set has poses but no ground-truth
         # images. Keep every existing COLMAP image for training and do not create

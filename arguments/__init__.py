@@ -68,6 +68,9 @@ class ModelParams(ParamGroup):
         # validation/ablation runs with ground truth.
         self.validation_ratio = 0.0
         self.validation_seed = 42
+        # Undistort SIMPLE_RADIAL inputs for the pinhole rasterizer and warp
+        # renders back to the raw camera domain when exporting.
+        self.correct_radial_distortion = False
 
         # Per-camera appearance embeddings are useful for uncontrolled exposure,
         # but test-pose UIDs do not identify matching train cameras in this dataset.

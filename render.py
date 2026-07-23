@@ -24,9 +24,11 @@ from scene import Scene
 import json
 import time
 from gaussian_renderer import render, prefilter_voxel
-import torchvision
 import random
 from tqdm import tqdm
+from PIL import Image
+from utils.distortion_utils import distort_render_to_raw
+from utils.image_io import save_image_high_quality, save_pil_high_quality
 from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
@@ -44,6 +46,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     per_view_dict = {}
     # debug = 0
     t_list = []
+    radial_warped = 0
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
 
         torch.cuda.synchronize(); t0 = time.time()
@@ -53,19 +56,46 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         
         t_list.append(t1-t0)
 
-        rendering = render_pkg["render"]
+        if getattr(view, "image_undistorted", False):
+            radial_warped += 1
+        rendering = distort_render_to_raw(render_pkg["render"], view)
         # Determine filename: use original filename with extension if present (from CSV)
         out_name = view.image_name if '.' in view.image_name else '{0:05d}.png'.format(idx)
         name_list.append(out_name)
         
-        torchvision.utils.save_image(rendering, os.path.join(render_path, out_name))
+        save_image_high_quality(
+            rendering,
+            os.path.join(render_path, out_name),
+        )
         if save_gt:
-            gt = view.original_image[0:3, :, :]
-            torchvision.utils.save_image(gt, os.path.join(gts_path, out_name))
+            gt_path = os.path.join(gts_path, out_name)
+            if (
+                getattr(view, "image_undistorted", False)
+                and getattr(view, "image_path", "")
+                and os.path.exists(view.image_path)
+            ):
+                with Image.open(view.image_path) as raw_source:
+                    raw_gt = raw_source.convert("RGB")
+                target_size = (view.image_width, view.image_height)
+                if raw_gt.size != target_size:
+                    resampling = getattr(Image, "Resampling", Image)
+                    raw_gt = raw_gt.resize(
+                        target_size,
+                        resampling.LANCZOS,
+                    )
+                save_pil_high_quality(raw_gt, gt_path)
+            else:
+                gt = view.original_image[0:3, :, :]
+                save_image_high_quality(gt, gt_path)
 
     t = np.array(t_list[5:])
     fps = 1.0 / t.mean()
     print(f'Test FPS: \033[1;35m{fps:.5f}\033[0m')
+    if radial_warped:
+        print(
+            f"Redistorted {radial_warped}/{len(views)} renders "
+            "to the raw SIMPLE_RADIAL camera domain"
+        )
 
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
             json.dump(per_view_dict, fp, indent=True)      

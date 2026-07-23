@@ -191,6 +191,23 @@ The loader then trains on 80% of the real COLMAP cameras, exposes the remaining
 20% as the test split, and ignores the ground-truth-free `test_poses.csv` for
 that run.
 
+For COLMAP `SIMPLE_RADIAL` scenes, enable the pinhole-compatible correction:
+
+```bash
+--appearance_dim 0 --correct_radial_distortion
+```
+
+Training and validation images are undistorted with their COLMAP `k1`.
+`render.py` then warps predictions back to the original radial camera domain
+before submission export. Ground-truth validation images are always read
+directly from the raw files, so distortion evaluation does not reuse a
+processed target. JPEG outputs are written at quality 100 with 4:4:4 chroma
+instead of Pillow/torchvision's default JPEG settings.
+
+Changing distortion correction or appearance dimensions changes the learned
+image domain/MLP shape. Train into a new model directory; do not resume an old
+checkpoint across either change.
+
 
 This script will store the log (with running-time code) into ```outputs/dataset_name/scene_name/exp_name/cur_time``` automatically.
 
