@@ -184,6 +184,43 @@ class OptimizationParams(ParamGroup):
         self.lambda_gaussianpro_normal = 0.05
         self.lambda_gaussianpro_depth_smooth = 0.01
 
+        # Full anchor-compatible progressive propagation. Unlike the
+        # GaussianPro-inspired losses above, this builds a multi-view camera
+        # graph, runs low-resolution PatchMatch-style depth propagation, checks
+        # geometric consistency, and inserts new Scaffold-GS anchors.
+        self.use_progressive_propagation = False
+        self.propagation_start_iter = 1500
+        self.propagation_until_iter = 12000
+        self.propagation_interval = 50
+        self.propagation_neighbors = 4
+        self.propagation_graph_samples = 4096
+        self.propagation_min_overlap = 0.05
+        self.propagation_downsample = 8
+        self.propagation_patch_radius = 2
+        self.propagation_patchmatch_iterations = 3
+        self.propagation_opacity_threshold = 0.5
+        self.propagation_coverage_threshold = 0.7
+        self.propagation_min_consistent_views = 2
+        self.propagation_max_photo_error = 0.35
+        self.propagation_reprojection_threshold = 2.0
+        self.propagation_depth_consistency_threshold = 0.03
+        self.propagation_normal_consistency_threshold = 0.5
+        self.propagation_depth_discrepancy_threshold = 0.15
+        self.propagation_max_anchors_per_step = 1024
+        self.propagation_voxel_factor = 1.0
+        self.propagation_seed = 42
+
+        # Full-form GaussianPro/Scaffold coupling: progressive propagation,
+        # plane-induced NCC, propagated source geometry, and a planar loss
+        # supervised by cached propagated normals.
+        self.use_gaussianpro_full = False
+        self.lambda_gaussianpro_full_flatten = 100.0
+        self.lambda_gaussianpro_full_normal_l1 = 0.001
+        self.lambda_gaussianpro_full_normal_cos = 0.001
+        self.gaussianpro_full_discrepancy_start = 1.0
+        self.gaussianpro_full_discrepancy_end = 0.8
+        self.gaussianpro_full_min_proposals = 100
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

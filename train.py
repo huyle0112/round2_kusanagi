@@ -21,6 +21,7 @@ os.system('echo $CUDA_VISIBLE_DEVICES')
 
 
 import torch
+import torch.nn.functional as F
 import torchvision
 import json
 import wandb
@@ -35,6 +36,7 @@ import random
 from random import randint
 from utils.loss_utils import l1_loss, charbonnier_loss, freq_loss, ssim
 from utils.gaussianpro_utils import gaussianpro_geometry_loss
+from utils.progressive_propagation import AnchorProgressivePropagator
 from gaussian_renderer import prefilter_voxel, render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -67,6 +69,96 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    progressive_propagator = None
+    propagation_stop_iteration = min(
+        opt.propagation_until_iter, opt.update_until
+    )
+    progressive_enabled = (
+        opt.use_progressive_propagation or opt.use_gaussianpro_full
+    )
+    if opt.use_gaussianpro_full and (
+        opt.use_gaussianpro or opt.use_progressive_propagation
+    ):
+        raise ValueError(
+            "use_gaussianpro_full already includes propagation and its own "
+            "plane constraint; do not combine GaussianPro modes"
+        )
+    if progressive_enabled:
+        if opt.propagation_voxel_factor <= 0:
+            raise ValueError("propagation_voxel_factor must be positive")
+        if (
+            opt.propagation_min_consistent_views
+            > opt.propagation_neighbors
+        ):
+            raise ValueError(
+                "propagation_min_consistent_views cannot exceed "
+                "propagation_neighbors"
+            )
+        if opt.propagation_start_iter >= propagation_stop_iteration:
+            raise ValueError(
+                "Progressive propagation needs propagation_start_iter < "
+                "min(propagation_until_iter, update_until)"
+            )
+        progressive_propagator = AnchorProgressivePropagator(
+            scene.getTrainCameras(),
+            gaussians.get_anchor.detach(),
+            num_neighbors=opt.propagation_neighbors,
+            graph_samples=opt.propagation_graph_samples,
+            min_overlap=opt.propagation_min_overlap,
+            downsample=opt.propagation_downsample,
+            patch_radius=opt.propagation_patch_radius,
+            patchmatch_iterations=opt.propagation_patchmatch_iterations,
+            opacity_threshold=opt.propagation_opacity_threshold,
+            coverage_threshold=opt.propagation_coverage_threshold,
+            min_consistent_views=opt.propagation_min_consistent_views,
+            max_photo_error=opt.propagation_max_photo_error,
+            reprojection_threshold=(
+                opt.propagation_reprojection_threshold
+            ),
+            depth_consistency_threshold=(
+                opt.propagation_depth_consistency_threshold
+            ),
+            normal_consistency_threshold=(
+                opt.propagation_normal_consistency_threshold
+            ),
+            depth_discrepancy_threshold=(
+                opt.propagation_depth_discrepancy_threshold
+            ),
+            max_anchors_per_step=opt.propagation_max_anchors_per_step,
+            min_proposals_per_step=(
+                opt.gaussianpro_full_min_proposals
+                if opt.use_gaussianpro_full
+                else 1
+            ),
+            use_plane_ncc=opt.use_gaussianpro_full,
+            propagate_source_views=opt.use_gaussianpro_full,
+            seed=opt.propagation_seed,
+        )
+        graph_sizes = [
+            len(neighbors)
+            for neighbors in progressive_propagator.graph.values()
+        ]
+        graph_mean = (
+            sum(graph_sizes) / len(graph_sizes) if graph_sizes else 0.0
+        )
+        message = (
+            "Full GaussianPro propagation enabled: "
+            if opt.use_gaussianpro_full
+            else "Progressive propagation enabled: "
+        )
+        message += (
+            f"{len(graph_sizes)} reference cameras, "
+            f"{graph_mean:.1f} neighbours/reference, "
+            f"iterations {opt.propagation_start_iter}-"
+            f"{propagation_stop_iteration}, "
+            f"interval {opt.propagation_interval}, "
+            f"downsample {opt.propagation_downsample}"
+        )
+        if logger:
+            logger.info(message)
+        else:
+            print(message)
 
     # Initialize LPIPS model if needed (cached, frozen)
     if opt.lambda_lpips > 0 and lpips_fn is None:
@@ -107,6 +199,70 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+        propagation_result = None
+        propagation_step = (
+            progressive_propagator is not None
+            and iteration >= opt.propagation_start_iter
+            and iteration < propagation_stop_iteration
+            and iteration % max(1, opt.propagation_interval) == 0
+        )
+        if propagation_step:
+            if opt.use_gaussianpro_full:
+                propagation_progress = (
+                    (iteration - opt.propagation_start_iter)
+                    / max(
+                        1,
+                        propagation_stop_iteration
+                        - opt.propagation_start_iter,
+                    )
+                )
+                propagation_progress = min(
+                    1.0, max(0.0, propagation_progress)
+                )
+                progressive_propagator.depth_discrepancy_threshold = (
+                    opt.gaussianpro_full_discrepancy_start
+                    + propagation_progress
+                    * (
+                        opt.gaussianpro_full_discrepancy_end
+                        - opt.gaussianpro_full_discrepancy_start
+                    )
+                )
+            propagation_camera = progressive_propagator.next_reference()
+            propagation_result, proposed_points, _proposed_normals = (
+                progressive_propagator.run(
+                    propagation_camera,
+                    gaussians,
+                    pipe,
+                    background,
+                    render,
+                    prefilter_voxel,
+                )
+            )
+            if proposed_points is not None:
+                propagation_result.added_count = (
+                    gaussians.add_propagated_anchors(
+                        proposed_points,
+                        voxel_size=(
+                            gaussians.voxel_size
+                            * opt.propagation_voxel_factor
+                        ),
+                    )
+                )
+            if logger:
+                logger.info(
+                    "[ITER %d] Propagation %s: candidates=%d, "
+                    "photo=%d, consistent=%d, proposed=%d, added=%d, "
+                    "photo_error=%.4f, views=%.2f",
+                    iteration,
+                    propagation_result.reference_name,
+                    propagation_result.candidate_count,
+                    propagation_result.photometric_count,
+                    propagation_result.consistent_count,
+                    propagation_result.proposed_count,
+                    propagation_result.added_count,
+                    propagation_result.mean_photo_error,
+                    propagation_result.mean_consistent_views,
+                )
         
         # Pick a random Camera
         if not viewpoint_stack:
@@ -122,6 +278,22 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             gaussianpro_active
             and iteration % max(1, opt.gaussianpro_interval) == 0
         )
+        gaussianpro_full_active = (
+            opt.use_gaussianpro_full
+            and iteration >= opt.propagation_start_iter
+        )
+        gaussianpro_full_plane_step = (
+            gaussianpro_full_active
+            and hasattr(viewpoint_cam, "gaussianpro_normal_target")
+        )
+        geometry_step = (
+            gaussianpro_geometry_step or gaussianpro_full_plane_step
+        )
+        geometry_downsample = (
+            opt.propagation_downsample
+            if gaussianpro_full_plane_step
+            else opt.gaussianpro_downsample
+        )
 
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
@@ -133,9 +305,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             visible_mask=voxel_visible_mask,
             retain_grad=retain_grad,
             return_depth=gaussianpro_geometry_step,
-            return_normal=gaussianpro_geometry_step,
+            return_normal=geometry_step,
             return_opacity=gaussianpro_geometry_step,
-            geometry_downsample=opt.gaussianpro_downsample,
+            geometry_downsample=geometry_downsample,
         )
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
@@ -157,6 +329,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gaussianpro_normal = None
         gaussianpro_depth_smooth = None
         gaussianpro_valid_ratio = None
+        gaussianpro_full_l1 = None
+        gaussianpro_full_cos = None
         if gaussianpro_active:
             # GaussianPro's planar prior: one covariance axis should become thin.
             sorted_scaling = scaling.sort(dim=1).values
@@ -187,6 +361,71 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 + opt.lambda_gaussianpro_depth_smooth * gaussianpro_depth_smooth
             )
 
+        if gaussianpro_full_active:
+            sorted_scaling = scaling.sort(dim=1).values
+            gaussianpro_flatten = sorted_scaling[:, 0].mean()
+            gaussianpro_flatness_ratio = (
+                sorted_scaling[:, 0]
+                / sorted_scaling[:, 1].clamp_min(1e-8)
+            ).mean()
+            loss = (
+                loss
+                + opt.lambda_gaussianpro_full_flatten
+                * gaussianpro_flatten
+            )
+
+        if gaussianpro_full_plane_step:
+            predicted_normal = F.normalize(
+                render_pkg["render_normal"], dim=0, eps=1e-6
+            )
+            target_normal = (
+                viewpoint_cam.gaussianpro_normal_target.to(
+                    device=predicted_normal.device,
+                    dtype=predicted_normal.dtype,
+                )
+            )
+            target_mask = viewpoint_cam.gaussianpro_target_mask.to(
+                device=predicted_normal.device
+            )
+            if target_normal.shape[-2:] != predicted_normal.shape[-2:]:
+                target_normal = F.interpolate(
+                    target_normal.unsqueeze(0),
+                    size=predicted_normal.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+                target_mask = (
+                    F.interpolate(
+                        target_mask.float()[None, None],
+                        size=predicted_normal.shape[-2:],
+                        mode="nearest",
+                    )[0, 0]
+                    > 0.5
+                )
+            target_normal = F.normalize(
+                target_normal, dim=0, eps=1e-6
+            )
+            if target_mask.any():
+                normal_difference = (
+                    predicted_normal - target_normal
+                ).abs().sum(dim=0)
+                angular_difference = 1.0 - (
+                    predicted_normal * target_normal
+                ).sum(dim=0).clamp(-1.0, 1.0)
+                gaussianpro_full_l1 = normal_difference[
+                    target_mask
+                ].mean()
+                gaussianpro_full_cos = angular_difference[
+                    target_mask
+                ].mean()
+                loss = (
+                    loss
+                    + opt.lambda_gaussianpro_full_normal_l1
+                    * gaussianpro_full_l1
+                    + opt.lambda_gaussianpro_full_normal_cos
+                    * gaussianpro_full_cos
+                )
+
         # LPIPS loss (delayed start for stable training)
         if opt.lambda_lpips > 0 and iteration >= opt.lpips_start_iter:
             lpips_value = lpips_fn(image.unsqueeze(0), gt_image.unsqueeze(0)).mean()
@@ -216,6 +455,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     postfix["GP-ratio"] = f"{gaussianpro_flatness_ratio.item():.3f}"
                 if gaussianpro_normal is not None:
                     postfix["GP-normal"] = f"{gaussianpro_normal.item():.4f}"
+                if gaussianpro_full_l1 is not None:
+                    postfix["GPF-l1"] = (
+                        f"{gaussianpro_full_l1.item():.4f}"
+                    )
+                    postfix["GPF-cos"] = (
+                        f"{gaussianpro_full_cos.item():.4f}"
+                    )
+                if propagation_result is not None:
+                    postfix["PP-add"] = propagation_result.added_count
+                    postfix["PP-cons"] = (
+                        propagation_result.consistent_count
+                    )
                 progress_bar.set_postfix(postfix)
                 progress_bar.update(10)
                 if tb_writer and gaussianpro_flatten is not None:
@@ -243,6 +494,38 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     tb_writer.add_scalar(
                         f"{dataset_name}/gaussianpro/valid_ratio",
                         gaussianpro_valid_ratio.item(),
+                        iteration,
+                    )
+                if tb_writer and gaussianpro_full_l1 is not None:
+                    tb_writer.add_scalar(
+                        f"{dataset_name}/gaussianpro_full/normal_l1",
+                        gaussianpro_full_l1.item(),
+                        iteration,
+                    )
+                    tb_writer.add_scalar(
+                        f"{dataset_name}/gaussianpro_full/normal_cos",
+                        gaussianpro_full_cos.item(),
+                        iteration,
+                    )
+                if tb_writer and propagation_result is not None:
+                    tb_writer.add_scalar(
+                        f"{dataset_name}/propagation/proposed",
+                        propagation_result.proposed_count,
+                        iteration,
+                    )
+                    tb_writer.add_scalar(
+                        f"{dataset_name}/propagation/added",
+                        propagation_result.added_count,
+                        iteration,
+                    )
+                    tb_writer.add_scalar(
+                        f"{dataset_name}/propagation/photo_error",
+                        propagation_result.mean_photo_error,
+                        iteration,
+                    )
+                    tb_writer.add_scalar(
+                        f"{dataset_name}/propagation/consistent_views",
+                        propagation_result.mean_consistent_views,
                         iteration,
                     )
             if iteration == opt.iterations:

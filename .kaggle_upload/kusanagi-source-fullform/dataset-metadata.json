@@ -1,0 +1,11 @@
+{
+  "id": "1234/kusanagi-source-fullform",
+  "title": "Kusanagi Scaffold-GS GaussianPro Full-form Source",
+  "subtitle": "Runtime source archive for private Kaggle GPU experiments",
+  "description": "Scaffold-GS runtime source with anchor-compatible full-form GaussianPro integration.",
+  "licenses": [
+    {
+      "name": "other"
+    }
+  ]
+}

@@ -134,7 +134,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
            scaling_modifier=1.0, visible_mask=None, retain_grad=False,
            return_depth=False, return_normal=False, return_opacity=False,
-           geometry_downsample=1):
+           geometry_downsample=1, geometry_only=False):
     """
     Render the scene. 
     
@@ -176,18 +176,24 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
         debug=pipe.debug
     )
 
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-    
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii = rasterizer(
-        means3D = xyz,
-        means2D = screenspace_points,
-        shs = None,
-        colors_precomp = color,
-        opacities = opacity,
-        scales = scaling,
-        rotations = rot,
-        cov3D_precomp = None)
+    if geometry_only and not (
+        return_depth or return_normal or return_opacity
+    ):
+        raise ValueError("geometry_only requires a geometry output")
+
+    if not geometry_only:
+        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+        # Rasterize visible Gaussians to image, obtain their radii (on screen).
+        rendered_image, radii = rasterizer(
+            means3D = xyz,
+            means2D = screenspace_points,
+            shs = None,
+            colors_precomp = color,
+            opacities = opacity,
+            scales = scaling,
+            rotations = rot,
+            cov3D_precomp = None)
 
     geometry_outputs = {}
     if return_depth or return_normal or return_opacity:
@@ -269,6 +275,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
             geometry_outputs["render_normal"] = F.normalize(
                 rendered_normal, dim=0, eps=1e-6
             )
+
+    if geometry_only:
+        return geometry_outputs
     
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     if is_training:

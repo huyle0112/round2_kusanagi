@@ -147,13 +147,14 @@ bash ./single_train.sh
 
 > For these public datasets, the configurations of 'voxel_size' and 'update_init_factor' can refer to the above batch training script. 
 
-### No-appearance + GaussianPro geometry regularisation
+### No-appearance + GaussianPro modes
 
 Per-camera appearance embeddings are disabled by default (`--appearance_dim 0`).
 This is important for test-pose CSVs whose camera UIDs do not correspond to
 training-camera UIDs.
 
-The repository also includes an anchor-compatible GaussianPro mode:
+The lightweight `--use_gaussianpro` mode is a GaussianPro-inspired
+regularizer:
 
 ```bash
 python train.py -s <scene> -m <output> --appearance_dim 0 \
@@ -170,15 +171,74 @@ growth. The extra geometry passes are downsampled and run every four
 iterations by default; RGB training and final rendering remain full
 resolution.
 
-This is the part of GaussianPro that can be applied safely to unordered
-Scaffold-GS camera sets. The original GaussianPro PatchMatch propagation is
-not enabled: it assumes time-ordered, overlapping neighbouring frames and a
-separate CUDA propagation extension.
+It is not the paper's progressive-propagation algorithm. For the
+anchor-compatible progressive-propagation path, use:
+
+```bash
+python train.py -s <scene> -m <new-output> --appearance_dim 0 \
+  --use_progressive_propagation \
+  --propagation_start_iter 1500 \
+  --propagation_until_iter 12000 \
+  --propagation_interval 50 \
+  --propagation_neighbors 4 \
+  --propagation_downsample 8
+```
+
+This path builds a neighbour graph from camera pose and shared anchor
+visibility, rather than filename order. At each propagation event it renders
+the reference plus overlapping source views, splats source depth hypotheses
+into the reference, performs normalized multi-view patch matching, propagates
+local slanted-plane hypotheses with deterministic depth search, and requires
+depth, normal and round-trip reprojection consistency. Accepted points are
+back-projected to world space, snapped to the Scaffold voxel grid,
+deduplicated, initialized with the nearest learned anchor feature, and
+appended together with valid Adam/densification state. This is a native
+PyTorch/Scaffold adaptation, not a bit-for-bit copy of GaussianPro's ordered
+video CUDA extension.
+
+For the complete Scaffold-compatible GaussianPro path, enable the full mode
+instead of either mode above:
+
+```bash
+python train.py -s <scene> -m <new-output> --appearance_dim 0 \
+  --use_gaussianpro_full \
+  --propagation_start_iter 1500 \
+  --propagation_until_iter 15000 \
+  --propagation_interval 50 \
+  --propagation_neighbors 4 \
+  --propagation_downsample 4
+```
+
+Full mode adds plane-induced multi-view NCC, recursively propagated source
+depth, geometric consistency filtering, an annealed 1.0-to-0.8 depth
+discrepancy threshold, and cached propagated-normal supervision. New anchors
+use four-neighbour latent-feature interpolation and a scale estimated from
+local anchor spacing. The plane loss combines minimum-axis flattening with L1
+and cosine normal agreement. Full COLMAP `fx/fy/cx/cy` intrinsics are used by
+both propagation and raster projection, including off-centre principal
+points.
+
+This implementation preserves Scaffold-GS anchors and neural Gaussian
+decoders. It reproduces the algorithmic GaussianPro pipeline in native
+PyTorch, but it is not ABI- or kernel-identical to the original 3DGS
+implementation.
+
+The default settings are conservative for full-resolution HCM images:
+geometry runs at 1/8 resolution and adds at most 1024 candidates per event.
+Look for `Propagation ... proposed=..., added=...` in the training log.
+Persistent zeros mean that thresholds or the camera graph reject all
+hypotheses; consistently hitting 1024 means the cap is active and should be
+validated for anchor growth/VRAM.
+
+Enable only one of `--use_gaussianpro`, `--use_progressive_propagation`, and
+`--use_gaussianpro_full` in an A/B test. The lightweight regularizer previously
+reduced the HCM validation metrics slightly and is not part of full mode.
 
 Models trained with appearance embeddings have a different colour-MLP input
 shape and cannot be resumed with `--appearance_dim 0`. Start a new output
-directory when changing this setting. The Kaggle notebook already uses
-`output_gaussianpro_noappearance` to avoid accidentally reusing an old model.
+directory when changing this setting. The Kaggle notebook uses a separate
+output folder for baseline, lightweight, propagation-only, and full-form
+experiments.
 
 For a deterministic ground-truth A/B validation split, pass the same options
 to both training and rendering:

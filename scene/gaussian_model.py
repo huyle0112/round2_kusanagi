@@ -11,6 +11,7 @@
 
 import torch
 from functools import reduce
+import math
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
 def scatter_max(src, index, dim=0):
@@ -682,6 +683,198 @@ class GaussianModel:
                 self._offset = optimizable_tensors["offset"]
                 self._opacity = optimizable_tensors["opacity"]
                 
+
+    @torch.no_grad()
+    def add_propagated_anchors(
+        self,
+        world_points,
+        voxel_size=None,
+        nearest_feature_chunk=64,
+    ):
+        """Insert multi-view propagated points directly into the anchor grid.
+
+        Candidate points are snapped to a voxel grid and deduplicated against
+        existing anchors. Their latent feature is interpolated from nearby
+        learned anchors and their scale follows the local anchor spacing.
+        Adam state and Scaffold-GS densification accumulators are extended
+        together so training can continue in the same iteration.
+        """
+        if world_points is None or world_points.numel() == 0:
+            return 0
+
+        cell_size = float(
+            self.voxel_size if voxel_size is None else voxel_size
+        )
+        if cell_size <= 0:
+            raise ValueError("Propagation voxel size must be positive")
+
+        finite = torch.isfinite(world_points).all(dim=-1)
+        world_points = world_points[finite].to(
+            device=self.get_anchor.device,
+            dtype=self.get_anchor.dtype,
+        )
+        if world_points.numel() == 0:
+            return 0
+
+        candidate_grid = torch.round(world_points / cell_size).to(torch.int64)
+        candidate_grid = torch.unique(candidate_grid, dim=0)
+        existing_grid = torch.round(
+            self.get_anchor.detach() / cell_size
+        ).to(torch.int64)
+
+        combined_grid = torch.cat((existing_grid, candidate_grid), dim=0)
+        _, inverse = torch.unique(
+            combined_grid, dim=0, return_inverse=True
+        )
+        existing_inverse = inverse[: existing_grid.shape[0]]
+        candidate_inverse = inverse[existing_grid.shape[0] :]
+        occupied = torch.zeros(
+            int(inverse.max().item()) + 1,
+            dtype=torch.bool,
+            device=inverse.device,
+        )
+        occupied[existing_inverse] = True
+        is_new = ~occupied[candidate_inverse]
+        candidate_grid = candidate_grid[is_new]
+        if candidate_grid.shape[0] == 0:
+            return 0
+
+        new_anchor = candidate_grid.to(self.get_anchor.dtype) * cell_size
+
+        # Interpolate multiple nearby learned features instead of resetting
+        # late anchors to zero or copying a single potentially unrelated
+        # anchor across a poorly covered region.
+        feature_chunks = []
+        nearest_indices = []
+        local_distance_chunks = []
+        anchors = self.get_anchor.detach()
+        anchor_norm = anchors.square().sum(dim=1).unsqueeze(0)
+        neighbour_count = min(4, int(anchors.shape[0]))
+        for start in range(0, new_anchor.shape[0], nearest_feature_chunk):
+            query = new_anchor[start : start + nearest_feature_chunk]
+            squared_distance = (
+                query.square().sum(dim=1, keepdim=True)
+                + anchor_norm
+                - 2.0 * query @ anchors.transpose(0, 1)
+            ).clamp_min(0.0)
+            knn_distance, knn_indices = torch.topk(
+                squared_distance,
+                k=neighbour_count,
+                dim=1,
+                largest=False,
+                sorted=True,
+            )
+            weights = knn_distance.sqrt().clamp_min(
+                cell_size * 0.1
+            ).reciprocal()
+            weights = weights / weights.sum(dim=1, keepdim=True)
+            neighbour_features = self._anchor_feat.detach()[knn_indices]
+            feature_chunks.append(
+                (neighbour_features * weights.unsqueeze(-1)).sum(dim=1)
+            )
+            nearest_indices.append(knn_indices[:, 0])
+            local_distance_chunks.append(knn_distance[:, 0].sqrt())
+        nearest_indices = torch.cat(nearest_indices)
+        new_feature = torch.cat(feature_chunks)
+        nearest_distance = torch.cat(local_distance_chunks)
+
+        local_scale = (0.5 * nearest_distance).clamp(
+            min=cell_size,
+            max=4.0 * cell_size,
+        )
+        new_scaling = torch.log(
+            local_scale.unsqueeze(1).repeat(1, 6)
+        )
+        new_rotation = self._rotation.detach()[nearest_indices].clone()
+        new_opacity = inverse_sigmoid(
+            torch.full(
+                (new_anchor.shape[0], 1),
+                0.1,
+                device=new_anchor.device,
+                dtype=new_anchor.dtype,
+            )
+        )
+        new_offsets = torch.zeros(
+            (new_anchor.shape[0], self.n_offsets, 3),
+            device=new_anchor.device,
+            dtype=new_anchor.dtype,
+        )
+
+        tensors = {
+            "anchor": new_anchor,
+            "scaling": new_scaling,
+            "rotation": new_rotation,
+            "anchor_feat": new_feature,
+            "offset": new_offsets,
+            "opacity": new_opacity,
+        }
+        optimizable_tensors = self.cat_tensors_to_optimizer(tensors)
+        self._anchor = optimizable_tensors["anchor"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+        self._anchor_feat = optimizable_tensors["anchor_feat"]
+        self._offset = optimizable_tensors["offset"]
+        self._opacity = optimizable_tensors["opacity"]
+
+        new_count = int(new_anchor.shape[0])
+        self.opacity_accum = torch.cat(
+            (
+                self.opacity_accum,
+                torch.zeros(
+                    (new_count, 1),
+                    device=self.opacity_accum.device,
+                    dtype=self.opacity_accum.dtype,
+                ),
+            ),
+            dim=0,
+        )
+        self.anchor_demon = torch.cat(
+            (
+                self.anchor_demon,
+                torch.zeros(
+                    (new_count, 1),
+                    device=self.anchor_demon.device,
+                    dtype=self.anchor_demon.dtype,
+                ),
+            ),
+            dim=0,
+        )
+        offset_rows = new_count * self.n_offsets
+        self.offset_gradient_accum = torch.cat(
+            (
+                self.offset_gradient_accum,
+                torch.zeros(
+                    (offset_rows, 1),
+                    device=self.offset_gradient_accum.device,
+                    dtype=self.offset_gradient_accum.dtype,
+                ),
+            ),
+            dim=0,
+        )
+        self.offset_denom = torch.cat(
+            (
+                self.offset_denom,
+                torch.zeros(
+                    (offset_rows, 1),
+                    device=self.offset_denom.device,
+                    dtype=self.offset_denom.dtype,
+                ),
+            ),
+            dim=0,
+        )
+        self.max_radii2D = torch.cat(
+            (
+                self.max_radii2D,
+                torch.zeros(
+                    new_count,
+                    device=self.max_radii2D.device,
+                    dtype=self.max_radii2D.dtype,
+                ),
+            ),
+            dim=0,
+        )
+        return new_count
+
 
 
     def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
