@@ -153,86 +153,38 @@ Per-camera appearance embeddings are disabled by default (`--appearance_dim 0`).
 This is important for test-pose CSVs whose camera UIDs do not correspond to
 training-camera UIDs.
 
-The lightweight `--use_gaussianpro` mode is a GaussianPro-inspired
-regularizer:
+Enable the unified GaussianPro anchor-growth path with:
 
 ```bash
 python train.py -s <scene> -m <output> --appearance_dim 0 \
   --use_gaussianpro \
-  --gaussianpro_start_iter 1000 \
-  --gaussianpro_interval 4 \
-  --gaussianpro_downsample 2
+  --gaussianpro_start_iter 1500 \
+  --gaussianpro_until_iter 30000 \
+  --gaussianpro_interval 50 \
+  --gaussianpro_neighbors 4 \
+  --gaussianpro_downsample 4
 ```
 
-This mode adds Gaussian flattening, camera-depth/normal consistency, and
-edge-aware inverse-depth smoothness. Geometry gradients flow through the
-existing Scaffold-GS screen-space statistics and therefore guide anchor
-growth. The extra geometry passes are downsampled and run every four
-iterations by default; RGB training and final rendering remain full
-resolution.
-
-It is not the paper's progressive-propagation algorithm. For the
-anchor-compatible progressive-propagation path, use:
-
-```bash
-python train.py -s <scene> -m <new-output> --appearance_dim 0 \
-  --use_progressive_propagation \
-  --propagation_start_iter 1500 \
-  --propagation_until_iter 12000 \
-  --propagation_interval 50 \
-  --propagation_neighbors 4 \
-  --propagation_downsample 8
-```
-
-This path builds a neighbour graph from camera pose and shared anchor
+GaussianPro replaces Scaffold-GS gradient-based anchor growth while leaving
+its renderer, neural Gaussian decoders, optimizer, photometric loss, and
+opacity pruning intact. It builds a neighbour graph from camera pose and shared anchor
 visibility, rather than filename order. At each propagation event it renders
 the reference plus overlapping source views, splats source depth hypotheses
 into the reference, performs normalized multi-view patch matching, propagates
-local slanted-plane hypotheses with deterministic depth search, and requires
-depth, normal and round-trip reprojection consistency. Accepted points are
-back-projected to world space, snapped to the Scaffold voxel grid,
-deduplicated, initialized with the nearest learned anchor feature, and
-appended together with valid Adam/densification state. This is a native
-PyTorch/Scaffold adaptation, not a bit-for-bit copy of GaussianPro's ordered
-video CUDA extension.
+local slanted-plane hypotheses, and requires photometric, depth, normal, and
+round-trip reprojection consistency. Accepted points are snapped to the
+Scaffold voxel grid, deduplicated, initialized by four-neighbour latent-feature
+interpolation, and appended together with valid Adam and densification state.
 
-For the complete Scaffold-compatible GaussianPro path, enable the full mode
-instead of either mode above:
+The new anchors immediately receive the original L1+DSSIM image loss. Cached
+propagated normals add L1 and cosine geometry supervision, while a normalized
+scale-ratio loss encourages planar Gaussians without collapsing raw scale.
+Propagation continues until `gaussianpro_until_iter`, capped so the final
+`gaussianpro_final_refine_iters` optimize the last anchors before saving.
 
-```bash
-python train.py -s <scene> -m <new-output> --appearance_dim 0 \
-  --use_gaussianpro_full \
-  --propagation_start_iter 1500 \
-  --propagation_until_iter 15000 \
-  --propagation_interval 50 \
-  --propagation_neighbors 4 \
-  --propagation_downsample 4
-```
-
-Full mode adds plane-induced multi-view NCC, recursively propagated source
-depth, geometric consistency filtering, an annealed 1.0-to-0.8 depth
-discrepancy threshold, and cached propagated-normal supervision. New anchors
-use four-neighbour latent-feature interpolation and a scale estimated from
-local anchor spacing. The plane loss combines minimum-axis flattening with L1
-and cosine normal agreement. Full COLMAP `fx/fy/cx/cy` intrinsics are used by
-both propagation and raster projection, including off-centre principal
-points.
-
-This implementation preserves Scaffold-GS anchors and neural Gaussian
-decoders. It reproduces the algorithmic GaussianPro pipeline in native
-PyTorch, but it is not ABI- or kernel-identical to the original 3DGS
-implementation.
-
-The default settings are conservative for full-resolution HCM images:
-geometry runs at 1/8 resolution and adds at most 1024 candidates per event.
-Look for `Propagation ... proposed=..., added=...` in the training log.
-Persistent zeros mean that thresholds or the camera graph reject all
-hypotheses; consistently hitting 1024 means the cap is active and should be
-validated for anchor growth/VRAM.
-
-Enable only one of `--use_gaussianpro`, `--use_progressive_propagation`, and
-`--use_gaussianpro_full` in an A/B test. The lightweight regularizer previously
-reduced the HCM validation metrics slightly and is not part of full mode.
+Full COLMAP `fx/fy/cx/cy` intrinsics are used by propagation and raster
+projection. Look for `GP-add` and `GP-cons` in the training log. Persistent
+`GP-add=0` means the final geometric/voxel filters reject all proposals.
 
 Models trained with appearance embeddings have a different colour-MLP input
 shape and cannot be resumed with `--appearance_dim 0`. Start a new output

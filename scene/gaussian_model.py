@@ -96,6 +96,7 @@ class GaussianModel:
         self.offset_denom = torch.empty(0)
 
         self.anchor_demon = torch.empty(0)
+        self._gaussianpro_anchor_mask = torch.empty(0, dtype=torch.bool)
                 
         self.optimizer = None
         self.percent_dense = 0
@@ -277,6 +278,9 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        self._gaussianpro_anchor_mask = torch.zeros(
+            self.get_anchor.shape[0], dtype=torch.bool, device="cuda"
+        )
 
 
     def training_setup(self, training_args):
@@ -467,6 +471,9 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._gaussianpro_anchor_mask = torch.zeros(
+            self.get_anchor.shape[0], dtype=torch.bool, device="cuda"
+        )
 
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -577,6 +584,10 @@ class GaussianModel:
         valid_points_mask = ~mask
 
         optimizable_tensors = self._prune_anchor_optimizer(valid_points_mask)
+        if self._gaussianpro_anchor_mask.numel() == valid_points_mask.numel():
+            self._gaussianpro_anchor_mask = self._gaussianpro_anchor_mask[
+                valid_points_mask
+            ]
 
         self._anchor = optimizable_tensors["anchor"]
         self._offset = optimizable_tensors["offset"]
@@ -817,6 +828,22 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
 
         new_count = int(new_anchor.shape[0])
+        if self._gaussianpro_anchor_mask.numel() != anchors.shape[0]:
+            self._gaussianpro_anchor_mask = torch.zeros(
+                anchors.shape[0],
+                dtype=torch.bool,
+                device=new_anchor.device,
+            )
+        self._gaussianpro_anchor_mask = torch.cat(
+            (
+                self._gaussianpro_anchor_mask,
+                torch.ones(
+                    new_count,
+                    dtype=torch.bool,
+                    device=new_anchor.device,
+                ),
+            )
+        )
         self.opacity_accum = torch.cat(
             (
                 self.opacity_accum,
@@ -875,16 +902,78 @@ class GaussianModel:
         )
         return new_count
 
+    def gaussianpro_feature_loss(self, sample_count=512):
+        """Keep propagated latent features locally coherent while they learn.
+
+        Only GaussianPro-created anchors are supervised. Neighbour features
+        are detached so the extra loss adapts new anchors without smoothing
+        the established Scaffold-GS representation.
+        """
+        if (
+            self._gaussianpro_anchor_mask.numel() != self.get_anchor.shape[0]
+            or not self._gaussianpro_anchor_mask.any()
+            or self.get_anchor.shape[0] < 2
+        ):
+            zero = self._anchor_feat.sum() * 0.0
+            return zero, zero
+
+        selected = torch.nonzero(
+            self._gaussianpro_anchor_mask, as_tuple=False
+        ).squeeze(1)
+        if selected.numel() > sample_count:
+            order = torch.randperm(selected.numel(), device=selected.device)
+            selected = selected[order[:sample_count]]
+
+        query = self.get_anchor.detach()[selected]
+        anchors = self.get_anchor.detach()
+        squared_distance = (
+            query.square().sum(dim=1, keepdim=True)
+            + anchors.square().sum(dim=1).unsqueeze(0)
+            - 2.0 * query @ anchors.transpose(0, 1)
+        ).clamp_min(0.0)
+        squared_distance[
+            torch.arange(selected.numel(), device=selected.device), selected
+        ] = torch.inf
+        neighbour_count = min(4, self.get_anchor.shape[0] - 1)
+        distances, indices = torch.topk(
+            squared_distance,
+            k=neighbour_count,
+            dim=1,
+            largest=False,
+            sorted=False,
+        )
+        weights = distances.sqrt().clamp_min(
+            max(float(self.voxel_size) * 0.1, 1e-8)
+        ).reciprocal()
+        weights = weights / weights.sum(dim=1, keepdim=True)
+        target = (
+            self._anchor_feat.detach()[indices] * weights.unsqueeze(-1)
+        ).sum(dim=1)
+        feature = self._anchor_feat[selected]
+        l1 = (feature - target).abs().mean()
+        cosine = 1.0 - torch.nn.functional.cosine_similarity(
+            feature, target, dim=-1, eps=1e-6
+        ).mean()
+        return l1, cosine
 
 
-    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
+
+    def adjust_anchor(
+        self,
+        check_interval=100,
+        success_threshold=0.8,
+        grad_threshold=0.0002,
+        min_opacity=0.005,
+        grow=True,
+    ):
         # # adding anchors
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
         
-        self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+        if grow:
+            self.anchor_growing(grads_norm, grad_threshold, offset_mask)
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0

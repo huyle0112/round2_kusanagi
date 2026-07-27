@@ -23,6 +23,7 @@ os.system('echo $CUDA_VISIBLE_DEVICES')
 import torch
 import torch.nn.functional as F
 import torchvision
+import csv
 import json
 import wandb
 import time
@@ -34,9 +35,8 @@ import torchvision.transforms.functional as tf
 import lpipsPyTorch as lpips
 import random
 from random import randint
-from utils.loss_utils import l1_loss, charbonnier_loss, freq_loss, ssim
-from utils.gaussianpro_utils import gaussianpro_geometry_loss
-from utils.progressive_propagation import AnchorProgressivePropagator
+from utils.loss_utils import l1_loss, ssim
+from utils.gaussianpro import GaussianProAnchorBuilder
 from gaussian_renderer import prefilter_voxel, render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -48,7 +48,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 
 # torch.set_num_threads(32)
-lpips_fn = None  # Lazy init inside training() to respect --lpips_net arg
+lpips_fn = None
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -70,103 +70,76 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
-    progressive_propagator = None
-    propagation_stop_iteration = min(
-        opt.propagation_until_iter, opt.update_until
+    gaussianpro = None
+    gaussianpro_stop_iteration = min(
+        opt.gaussianpro_until_iter,
+        max(
+            opt.gaussianpro_start_iter + 1,
+            opt.iterations - opt.gaussianpro_final_refine_iters,
+        ),
     )
-    progressive_enabled = (
-        opt.use_progressive_propagation or opt.use_gaussianpro_full
-    )
-    if opt.use_gaussianpro_full and (
-        opt.use_gaussianpro or opt.use_progressive_propagation
-    ):
-        raise ValueError(
-            "use_gaussianpro_full already includes propagation and its own "
-            "plane constraint; do not combine GaussianPro modes"
-        )
-    if progressive_enabled:
-        if opt.propagation_voxel_factor <= 0:
-            raise ValueError("propagation_voxel_factor must be positive")
-        if (
-            opt.propagation_min_consistent_views
-            > opt.propagation_neighbors
-        ):
+    if opt.use_gaussianpro:
+        if opt.gaussianpro_voxel_factor <= 0:
+            raise ValueError("gaussianpro_voxel_factor must be positive")
+        if opt.gaussianpro_min_consistent_views > opt.gaussianpro_neighbors:
             raise ValueError(
-                "propagation_min_consistent_views cannot exceed "
-                "propagation_neighbors"
+                "gaussianpro_min_consistent_views cannot exceed "
+                "gaussianpro_neighbors"
             )
-        if opt.propagation_start_iter >= propagation_stop_iteration:
+        if opt.gaussianpro_start_iter >= gaussianpro_stop_iteration:
             raise ValueError(
-                "Progressive propagation needs propagation_start_iter < "
-                "min(propagation_until_iter, update_until)"
+                "GaussianPro needs a non-empty propagation window before "
+                "the final refinement iterations"
             )
-        progressive_propagator = AnchorProgressivePropagator(
+        gaussianpro = GaussianProAnchorBuilder(
             scene.getTrainCameras(),
             gaussians.get_anchor.detach(),
-            num_neighbors=opt.propagation_neighbors,
-            graph_samples=opt.propagation_graph_samples,
-            min_overlap=opt.propagation_min_overlap,
-            downsample=opt.propagation_downsample,
-            patch_radius=opt.propagation_patch_radius,
-            patchmatch_iterations=opt.propagation_patchmatch_iterations,
-            opacity_threshold=opt.propagation_opacity_threshold,
-            coverage_threshold=opt.propagation_coverage_threshold,
-            min_consistent_views=opt.propagation_min_consistent_views,
-            max_photo_error=opt.propagation_max_photo_error,
-            reprojection_threshold=(
-                opt.propagation_reprojection_threshold
-            ),
+            num_neighbors=opt.gaussianpro_neighbors,
+            graph_samples=opt.gaussianpro_graph_samples,
+            min_overlap=opt.gaussianpro_min_overlap,
+            downsample=opt.gaussianpro_downsample,
+            patch_radius=opt.gaussianpro_patch_radius,
+            patchmatch_iterations=opt.gaussianpro_patchmatch_iterations,
+            opacity_threshold=opt.gaussianpro_opacity_threshold,
+            coverage_threshold=opt.gaussianpro_coverage_threshold,
+            min_consistent_views=opt.gaussianpro_min_consistent_views,
+            max_photo_error=opt.gaussianpro_max_photo_error,
+            reprojection_threshold=opt.gaussianpro_reprojection_threshold,
             depth_consistency_threshold=(
-                opt.propagation_depth_consistency_threshold
+                opt.gaussianpro_depth_consistency_threshold
             ),
             normal_consistency_threshold=(
-                opt.propagation_normal_consistency_threshold
+                opt.gaussianpro_normal_consistency_threshold
             ),
             depth_discrepancy_threshold=(
-                opt.propagation_depth_discrepancy_threshold
+                opt.gaussianpro_depth_discrepancy_threshold
             ),
-            max_anchors_per_step=opt.propagation_max_anchors_per_step,
-            min_proposals_per_step=(
-                opt.gaussianpro_full_min_proposals
-                if opt.use_gaussianpro_full
-                else 1
-            ),
-            use_plane_ncc=opt.use_gaussianpro_full,
-            propagate_source_views=opt.use_gaussianpro_full,
-            seed=opt.propagation_seed,
+            max_anchors_per_step=opt.gaussianpro_max_anchors_per_step,
+            min_proposals_per_step=1,
+            use_plane_ncc=True,
+            propagate_source_views=True,
+            seed=opt.gaussianpro_seed,
         )
         graph_sizes = [
             len(neighbors)
-            for neighbors in progressive_propagator.graph.values()
+            for neighbors in gaussianpro.graph.values()
         ]
         graph_mean = (
             sum(graph_sizes) / len(graph_sizes) if graph_sizes else 0.0
         )
         message = (
-            "Full GaussianPro propagation enabled: "
-            if opt.use_gaussianpro_full
-            else "Progressive propagation enabled: "
-        )
-        message += (
+            "GaussianPro anchor growth enabled: "
             f"{len(graph_sizes)} reference cameras, "
             f"{graph_mean:.1f} neighbours/reference, "
-            f"iterations {opt.propagation_start_iter}-"
-            f"{propagation_stop_iteration}, "
-            f"interval {opt.propagation_interval}, "
-            f"downsample {opt.propagation_downsample}"
+            f"iterations {opt.gaussianpro_start_iter}-"
+            f"{gaussianpro_stop_iteration}, "
+            f"interval {opt.gaussianpro_interval}, "
+            f"downsample {opt.gaussianpro_downsample}"
         )
         if logger:
             logger.info(message)
         else:
             print(message)
-
-    # Initialize LPIPS model if needed (cached, frozen)
-    if opt.lambda_lpips > 0 and lpips_fn is None:
-        lpips_fn = lpips.LPIPS(opt.lpips_net).to('cuda')
-        lpips_fn.eval()
-        lpips_fn.requires_grad_(False)
-        if logger:
-            logger.info(f"LPIPS model initialized with {opt.lpips_net} backbone")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -199,38 +172,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        propagation_result = None
-        propagation_step = (
-            progressive_propagator is not None
-            and iteration >= opt.propagation_start_iter
-            and iteration < propagation_stop_iteration
-            and iteration % max(1, opt.propagation_interval) == 0
+        gaussianpro_result = None
+        gaussianpro_step = (
+            gaussianpro is not None
+            and iteration >= opt.gaussianpro_start_iter
+            and iteration < gaussianpro_stop_iteration
+            and iteration % max(1, opt.gaussianpro_interval) == 0
         )
-        if propagation_step:
-            if opt.use_gaussianpro_full:
-                propagation_progress = (
-                    (iteration - opt.propagation_start_iter)
-                    / max(
-                        1,
-                        propagation_stop_iteration
-                        - opt.propagation_start_iter,
-                    )
-                )
-                propagation_progress = min(
-                    1.0, max(0.0, propagation_progress)
-                )
-                progressive_propagator.depth_discrepancy_threshold = (
-                    opt.gaussianpro_full_discrepancy_start
-                    + propagation_progress
-                    * (
-                        opt.gaussianpro_full_discrepancy_end
-                        - opt.gaussianpro_full_discrepancy_start
-                    )
-                )
-            propagation_camera = progressive_propagator.next_reference()
-            propagation_result, proposed_points, _proposed_normals = (
-                progressive_propagator.run(
-                    propagation_camera,
+        if gaussianpro_step:
+            reference_camera = gaussianpro.next_reference()
+            gaussianpro_result, proposed_points, _proposed_normals = (
+                gaussianpro.run(
+                    reference_camera,
                     gaussians,
                     pipe,
                     background,
@@ -239,12 +192,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 )
             )
             if proposed_points is not None:
-                propagation_result.added_count = (
+                gaussianpro_result.added_count = (
                     gaussians.add_propagated_anchors(
                         proposed_points,
                         voxel_size=(
                             gaussians.voxel_size
-                            * opt.propagation_voxel_factor
+                            * opt.gaussianpro_voxel_factor
                         ),
                     )
                 )
@@ -254,14 +207,14 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     "photo=%d, consistent=%d, proposed=%d, added=%d, "
                     "photo_error=%.4f, views=%.2f",
                     iteration,
-                    propagation_result.reference_name,
-                    propagation_result.candidate_count,
-                    propagation_result.photometric_count,
-                    propagation_result.consistent_count,
-                    propagation_result.proposed_count,
-                    propagation_result.added_count,
-                    propagation_result.mean_photo_error,
-                    propagation_result.mean_consistent_views,
+                    gaussianpro_result.reference_name,
+                    gaussianpro_result.candidate_count,
+                    gaussianpro_result.photometric_count,
+                    gaussianpro_result.consistent_count,
+                    gaussianpro_result.proposed_count,
+                    gaussianpro_result.added_count,
+                    gaussianpro_result.mean_photo_error,
+                    gaussianpro_result.mean_consistent_views,
                 )
         
         # Pick a random Camera
@@ -273,26 +226,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         if (iteration - 1) == debug_from:
             pipe.debug = True
         
-        gaussianpro_active = opt.use_gaussianpro and iteration >= opt.gaussianpro_start_iter
-        gaussianpro_geometry_step = (
+        gaussianpro_active = (
+            gaussianpro is not None
+            and iteration >= opt.gaussianpro_start_iter
+        )
+        gaussianpro_plane_step = (
             gaussianpro_active
-            and iteration % max(1, opt.gaussianpro_interval) == 0
-        )
-        gaussianpro_full_active = (
-            opt.use_gaussianpro_full
-            and iteration >= opt.propagation_start_iter
-        )
-        gaussianpro_full_plane_step = (
-            gaussianpro_full_active
             and hasattr(viewpoint_cam, "gaussianpro_normal_target")
-        )
-        geometry_step = (
-            gaussianpro_geometry_step or gaussianpro_full_plane_step
-        )
-        geometry_downsample = (
-            opt.propagation_downsample
-            if gaussianpro_full_plane_step
-            else opt.gaussianpro_downsample
         )
 
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
@@ -304,77 +244,52 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             background,
             visible_mask=voxel_visible_mask,
             retain_grad=retain_grad,
-            return_depth=gaussianpro_geometry_step,
-            return_normal=geometry_step,
-            return_opacity=gaussianpro_geometry_step,
-            geometry_downsample=geometry_downsample,
+            return_normal=gaussianpro_plane_step,
+            geometry_downsample=opt.gaussianpro_downsample,
         )
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
         gt_image = viewpoint_cam.original_image.cuda()
 
-        # Pixel loss: Charbonnier (smooth L1) or standard L1
-        if opt.use_charbonnier:
-            Ll1 = charbonnier_loss(image, gt_image)
-        else:
-            Ll1 = l1_loss(image, gt_image)
+        Ll1 = l1_loss(image, gt_image)
 
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
 
-        gaussianpro_flatten = None
         gaussianpro_flatness_ratio = None
-        gaussianpro_normal = None
-        gaussianpro_depth_smooth = None
-        gaussianpro_valid_ratio = None
-        gaussianpro_full_l1 = None
-        gaussianpro_full_cos = None
+        gaussianpro_normal_l1 = None
+        gaussianpro_normal_cos = None
+        gaussianpro_feature_l1 = None
+        gaussianpro_feature_cos = None
         if gaussianpro_active:
-            # GaussianPro's planar prior: one covariance axis should become thin.
+            # Penalize scale ratio, not raw scale, to avoid covariance collapse.
             sorted_scaling = scaling.sort(dim=1).values
-            gaussianpro_flatten = sorted_scaling[:, 0].mean()
             gaussianpro_flatness_ratio = (
                 sorted_scaling[:, 0] / sorted_scaling[:, 1].clamp_min(1e-8)
             ).mean()
-            loss = loss + opt.lambda_gaussianpro_flatten * gaussianpro_flatten
-
-        if gaussianpro_geometry_step:
-            (
-                gaussianpro_normal,
-                gaussianpro_depth_smooth,
-                gaussianpro_valid_ratio,
-            ) = gaussianpro_geometry_loss(
-                render_pkg["render_depth"],
-                render_pkg["render_normal"],
-                render_pkg["render_opacity"],
-                gt_image,
-                viewpoint_cam.FoVx,
-                viewpoint_cam.FoVy,
-                opacity_threshold=opt.gaussianpro_opacity_threshold,
-                edge_weight=opt.gaussianpro_edge_weight,
-            )
             loss = (
                 loss
-                + opt.lambda_gaussianpro_normal * gaussianpro_normal
-                + opt.lambda_gaussianpro_depth_smooth * gaussianpro_depth_smooth
+                + opt.lambda_gaussianpro_flatness
+                * gaussianpro_flatness_ratio
             )
+            if iteration % max(1, opt.gaussianpro_feature_interval) == 0:
+                (
+                    gaussianpro_feature_l1,
+                    gaussianpro_feature_cos,
+                ) = gaussians.gaussianpro_feature_loss(
+                    sample_count=opt.gaussianpro_feature_samples
+                )
+                loss = (
+                    loss
+                    + opt.lambda_gaussianpro_feature_l1
+                    * gaussianpro_feature_l1
+                    + opt.lambda_gaussianpro_feature_cos
+                    * gaussianpro_feature_cos
+                )
 
-        if gaussianpro_full_active:
-            sorted_scaling = scaling.sort(dim=1).values
-            gaussianpro_flatten = sorted_scaling[:, 0].mean()
-            gaussianpro_flatness_ratio = (
-                sorted_scaling[:, 0]
-                / sorted_scaling[:, 1].clamp_min(1e-8)
-            ).mean()
-            loss = (
-                loss
-                + opt.lambda_gaussianpro_full_flatten
-                * gaussianpro_flatten
-            )
-
-        if gaussianpro_full_plane_step:
+        if gaussianpro_plane_step:
             predicted_normal = F.normalize(
                 render_pkg["render_normal"], dim=0, eps=1e-6
             )
@@ -412,29 +327,19 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 angular_difference = 1.0 - (
                     predicted_normal * target_normal
                 ).sum(dim=0).clamp(-1.0, 1.0)
-                gaussianpro_full_l1 = normal_difference[
+                gaussianpro_normal_l1 = normal_difference[
                     target_mask
                 ].mean()
-                gaussianpro_full_cos = angular_difference[
+                gaussianpro_normal_cos = angular_difference[
                     target_mask
                 ].mean()
                 loss = (
                     loss
-                    + opt.lambda_gaussianpro_full_normal_l1
-                    * gaussianpro_full_l1
-                    + opt.lambda_gaussianpro_full_normal_cos
-                    * gaussianpro_full_cos
+                    + opt.lambda_gaussianpro_normal_l1
+                    * gaussianpro_normal_l1
+                    + opt.lambda_gaussianpro_normal_cos
+                    * gaussianpro_normal_cos
                 )
-
-        # LPIPS loss (delayed start for stable training)
-        if opt.lambda_lpips > 0 and iteration >= opt.lpips_start_iter:
-            lpips_value = lpips_fn(image.unsqueeze(0), gt_image.unsqueeze(0)).mean()
-            loss = loss + opt.lambda_lpips * lpips_value
-
-        # Frequency loss (FFT-based)
-        if opt.lambda_freq > 0:
-            freq_value = freq_loss(image, gt_image)
-            loss = loss + opt.lambda_freq * freq_value
 
         loss.backward()
         
@@ -446,93 +351,80 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
             if iteration % 10 == 0:
                 postfix = {"Loss": f"{ema_loss_for_log:.{7}f}"}
-                if opt.lambda_lpips > 0 and iteration >= opt.lpips_start_iter:
-                    postfix["LPIPS"] = f"{lpips_value.item():.4f}"
-                if opt.lambda_freq > 0:
-                    postfix["Freq"] = f"{freq_value.item():.4f}"
-                if gaussianpro_flatten is not None:
-                    postfix["GP-flat"] = f"{gaussianpro_flatten.item():.2e}"
+                if gaussianpro_flatness_ratio is not None:
                     postfix["GP-ratio"] = f"{gaussianpro_flatness_ratio.item():.3f}"
-                if gaussianpro_normal is not None:
-                    postfix["GP-normal"] = f"{gaussianpro_normal.item():.4f}"
-                if gaussianpro_full_l1 is not None:
+                if gaussianpro_normal_l1 is not None:
                     postfix["GPF-l1"] = (
-                        f"{gaussianpro_full_l1.item():.4f}"
+                        f"{gaussianpro_normal_l1.item():.4f}"
                     )
                     postfix["GPF-cos"] = (
-                        f"{gaussianpro_full_cos.item():.4f}"
+                        f"{gaussianpro_normal_cos.item():.4f}"
                     )
-                if propagation_result is not None:
-                    postfix["PP-add"] = propagation_result.added_count
-                    postfix["PP-cons"] = (
-                        propagation_result.consistent_count
+                if gaussianpro_feature_l1 is not None:
+                    postfix["GP-feat"] = (
+                        f"{gaussianpro_feature_l1.item():.4f}"
+                    )
+                if gaussianpro_result is not None:
+                    postfix["GP-add"] = gaussianpro_result.added_count
+                    postfix["GP-cons"] = (
+                        gaussianpro_result.consistent_count
                     )
                 progress_bar.set_postfix(postfix)
                 progress_bar.update(10)
-                if tb_writer and gaussianpro_flatten is not None:
-                    tb_writer.add_scalar(
-                        f"{dataset_name}/gaussianpro/flatten",
-                        gaussianpro_flatten.item(),
-                        iteration,
-                    )
+                if tb_writer and gaussianpro_flatness_ratio is not None:
                     tb_writer.add_scalar(
                         f"{dataset_name}/gaussianpro/flatness_ratio",
                         gaussianpro_flatness_ratio.item(),
                         iteration,
                     )
-                if tb_writer and gaussianpro_normal is not None:
+                if tb_writer and gaussianpro_normal_l1 is not None:
                     tb_writer.add_scalar(
-                        f"{dataset_name}/gaussianpro/normal",
-                        gaussianpro_normal.item(),
+                        f"{dataset_name}/gaussianpro/normal_l1",
+                        gaussianpro_normal_l1.item(),
                         iteration,
                     )
                     tb_writer.add_scalar(
-                        f"{dataset_name}/gaussianpro/depth_smooth",
-                        gaussianpro_depth_smooth.item(),
+                        f"{dataset_name}/gaussianpro/normal_cos",
+                        gaussianpro_normal_cos.item(),
+                        iteration,
+                    )
+                if tb_writer and gaussianpro_feature_l1 is not None:
+                    tb_writer.add_scalar(
+                        f"{dataset_name}/gaussianpro/feature_l1",
+                        gaussianpro_feature_l1.item(),
                         iteration,
                     )
                     tb_writer.add_scalar(
-                        f"{dataset_name}/gaussianpro/valid_ratio",
-                        gaussianpro_valid_ratio.item(),
+                        f"{dataset_name}/gaussianpro/feature_cos",
+                        gaussianpro_feature_cos.item(),
                         iteration,
                     )
-                if tb_writer and gaussianpro_full_l1 is not None:
+                if tb_writer and gaussianpro_result is not None:
                     tb_writer.add_scalar(
-                        f"{dataset_name}/gaussianpro_full/normal_l1",
-                        gaussianpro_full_l1.item(),
-                        iteration,
-                    )
-                    tb_writer.add_scalar(
-                        f"{dataset_name}/gaussianpro_full/normal_cos",
-                        gaussianpro_full_cos.item(),
-                        iteration,
-                    )
-                if tb_writer and propagation_result is not None:
-                    tb_writer.add_scalar(
-                        f"{dataset_name}/propagation/proposed",
-                        propagation_result.proposed_count,
+                        f"{dataset_name}/gaussianpro/proposed",
+                        gaussianpro_result.proposed_count,
                         iteration,
                     )
                     tb_writer.add_scalar(
-                        f"{dataset_name}/propagation/added",
-                        propagation_result.added_count,
+                        f"{dataset_name}/gaussianpro/added",
+                        gaussianpro_result.added_count,
                         iteration,
                     )
                     tb_writer.add_scalar(
-                        f"{dataset_name}/propagation/photo_error",
-                        propagation_result.mean_photo_error,
+                        f"{dataset_name}/gaussianpro/photo_error",
+                        gaussianpro_result.mean_photo_error,
                         iteration,
                     )
                     tb_writer.add_scalar(
-                        f"{dataset_name}/propagation/consistent_views",
-                        propagation_result.mean_consistent_views,
+                        f"{dataset_name}/gaussianpro/consistent_views",
+                        gaussianpro_result.mean_consistent_views,
                         iteration,
                     )
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
+            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, opt.lambda_dssim, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -544,8 +436,19 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 
                 # densification
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
-                    gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity)
-            elif iteration == opt.update_until:
+                    gaussians.adjust_anchor(
+                        check_interval=opt.update_interval,
+                        success_threshold=opt.success_threshold,
+                        grad_threshold=opt.densify_grad_threshold,
+                        min_opacity=opt.min_opacity,
+                        grow=not opt.use_gaussianpro,
+                    )
+            cleanup_iteration = (
+                gaussianpro_stop_iteration
+                if gaussianpro is not None
+                else opt.update_until
+            )
+            if iteration == cleanup_iteration:
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
                 del gaussians.offset_denom
@@ -581,29 +484,67 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None):
+def _append_monitor_row(path, fieldnames, row):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, lambda_dssim, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None):
     if tb_writer:
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/pixel_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/iter_time', elapsed, iteration)
 
+    if iteration == 1 or iteration % 100 == 0:
+        _append_monitor_row(
+            Path(scene.model_path) / "train_curve.csv",
+            ["iteration", "train_l1", "train_total_loss", "anchors"],
+            {
+                "iteration": iteration,
+                "train_l1": float(Ll1.item()),
+                "train_total_loss": float(loss.item()),
+                "anchors": int(scene.gaussians.get_anchor.shape[0]),
+            },
+        )
 
     if wandb is not None:
         wandb.log({"train_l1_loss":Ll1, 'train_total_loss':loss, })
     
-    # Report test and samples of training set
     if iteration in testing_iterations:
+        global lpips_fn
+        if lpips_fn is None:
+            lpips_fn = lpips.LPIPS("vgg").to("cuda")
+            lpips_fn.eval()
+            lpips_fn.requires_grad_(False)
+
         scene.gaussians.eval()
         torch.cuda.empty_cache()
         train_cameras = scene.getTrainCameras()
-        sample_size = min(20, len(train_cameras))
-        validation_cameras = random.Random(iteration).sample(train_cameras, sample_size)
-        validation_configs = ({'name': 'train', 'cameras': validation_cameras},)
+        val_cameras = scene.getTestCameras()
+        train_sample_size = min(
+            len(train_cameras),
+            max(1, len(val_cameras)),
+        )
+        train_eval_cameras = random.Random(42).sample(
+            train_cameras, train_sample_size
+        )
+        validation_configs = (
+            {"name": "train_eval", "cameras": train_eval_cameras},
+            {"name": "val", "cameras": val_cameras},
+        )
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                ssim_test = 0.0
+                lpips_test = 0.0
                 
                 if wandb is not None:
                     gt_image_list = []
@@ -614,7 +555,7 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                     voxel_visible_mask = prefilter_voxel(viewpoint, scene.gaussians, *renderArgs)
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if tb_writer and (idx < 30):
+                    if tb_writer and (idx < 3):
                         tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/errormap".format(viewpoint.image_name), (gt_image[None]-image[None]).abs(), global_step=iteration)
 
@@ -629,22 +570,76 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
 
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    ssim_test += ssim(image, gt_image).mean().double()
+                    lpips_test += lpips_fn(
+                        image.unsqueeze(0), gt_image.unsqueeze(0)
+                    ).mean().double()
 
-                
-                
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                logger.info("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-
-                
+                camera_count = len(config["cameras"])
+                psnr_test /= camera_count
+                l1_test /= camera_count
+                ssim_test /= camera_count
+                lpips_test /= camera_count
+                photo_loss = (
+                    (1.0 - lambda_dssim) * l1_test
+                    + lambda_dssim * (1.0 - ssim_test)
+                )
+                metrics_row = {
+                    "iteration": iteration,
+                    "split": config["name"],
+                    "count": camera_count,
+                    "photo_loss": float(photo_loss.item()),
+                    "l1": float(l1_test.item()),
+                    "psnr": float(psnr_test.item()),
+                    "ssim": float(ssim_test.item()),
+                    "lpips": float(lpips_test.item()),
+                    "anchors": int(scene.gaussians.get_anchor.shape[0]),
+                }
+                _append_monitor_row(
+                    Path(scene.model_path) / "validation_metrics.csv",
+                    [
+                        "iteration",
+                        "split",
+                        "count",
+                        "photo_loss",
+                        "l1",
+                        "psnr",
+                        "ssim",
+                        "lpips",
+                        "anchors",
+                    ],
+                    metrics_row,
+                )
+                logger.info(
+                    "\n[ITER %d] %s (%d views): loss=%.6f "
+                    "PSNR=%.4f SSIM=%.5f LPIPS=%.5f",
+                    iteration,
+                    config["name"],
+                    camera_count,
+                    metrics_row["photo_loss"],
+                    metrics_row["psnr"],
+                    metrics_row["ssim"],
+                    metrics_row["lpips"],
+                )
                 if tb_writer:
-                    tb_writer.add_scalar(f'{dataset_name}/'+config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(f'{dataset_name}/'+config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    for metric_name in (
+                        "photo_loss", "l1", "psnr", "ssim", "lpips"
+                    ):
+                        tb_writer.add_scalar(
+                            f"{dataset_name}/{config['name']}/{metric_name}",
+                            metrics_row[metric_name],
+                            iteration,
+                        )
                 if wandb is not None:
-                    wandb.log({f"{config['name']}_loss_viewpoint_l1_loss":l1_test, f"{config['name']}_PSNR":psnr_test})
+                    wandb.log(
+                        {
+                            f"{config['name']}_{key}": value
+                            for key, value in metrics_row.items()
+                            if isinstance(value, (int, float))
+                        }
+                    )
 
         if tb_writer:
-            # tb_writer.add_histogram(f'{dataset_name}/'+"scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar(f'{dataset_name}/'+'total_points', scene.gaussians.get_anchor.shape[0], iteration)
         torch.cuda.empty_cache()
 

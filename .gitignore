@@ -1,21 +1,66 @@
-*.pyc
-.vscode
-temp*
-outputs*
-debug*
-log*
-view*
-wandb*
+# Python / environments
+__pycache__/
+*.py[cod]
+.venv/
+.venv-*/
+venv/
+env/
+
+# Editors and temporary files
+.vscode/
+.idea/
 *.bak
-data
-*build/*
-*__pycache__*
-diff_rasterization/diff_rast.egg-info
-diff_rasterization/dist
-tensorboard_3d
-screenshots
+*.tmp
+temp*/
+debug*/
+screenshots/
+
+# Datasets and generated scene data
+/data/
+/pose/
+/fsub/
+/scenes/
+**/dense/
+**/distorted/
+**/sparse/**/*.bin
+
+# Training outputs, checkpoints and experiment logs
+/output/
+/output*/
+/outputs/
+/outputs*/
+/scene_zips/
+/wandb/
+wandb*/
+/tensorboard_3d/
+events.out.tfevents.*
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.log
+
+# Submission archives and other large compressed files
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+submission_v2_*/
+/submission*/
+
+# Local Kaggle packaging/work directories (not kaggle_*.py/ipynb files)
+/.kaggle*/
+/kaggle*/
+
+# Build artifacts
+build/
+*build/
+dist/
+*.egg-info/
+diff_rasterization/diff_rast.egg-info/
+diff_rasterization/dist/
 *.so
-scenes/
-data/
-pose/
-fsub/
+*.pyd
+*.dll
