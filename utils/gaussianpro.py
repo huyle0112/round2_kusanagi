@@ -437,6 +437,7 @@ class GaussianProAnchorBuilder:
         self.reference_order = self.cameras.copy()
         order_rng.shuffle(self.reference_order)
         self.reference_cursor = 0
+        self.last_point_confidence = None
 
     def next_reference(self):
         camera = self.reference_order[
@@ -906,8 +907,10 @@ class GaussianProAnchorBuilder:
         background,
         render_fn,
         prefilter_fn,
+        require_new_anchor=True,
     ):
         result = PropagationResult(reference_camera.image_name)
+        self.last_point_confidence = None
         self._ray_cache.clear()
         neighbor_cameras = self.graph.get(reference_camera.image_name, [])
         if len(neighbor_cameras) < self.min_consistent_views:
@@ -1053,13 +1056,9 @@ class GaussianProAnchorBuilder:
             border_valid[-self.patch_radius :] = False
             border_valid[:, : self.patch_radius] = False
             border_valid[:, -self.patch_radius :] = False
-        accepted = (
-            photo_mask
-            & geometry_mask
-            & needs_anchor
-            & normal_valid
-            & border_valid
-        )
+        accepted = photo_mask & geometry_mask & normal_valid & border_valid
+        if require_new_anchor:
+            accepted = accepted & needs_anchor
 
         accepted_indices = accepted.flatten().nonzero().squeeze(1)
         result.proposed_count = int(accepted_indices.numel())
@@ -1077,6 +1076,7 @@ class GaussianProAnchorBuilder:
                 score, self.max_anchors_per_step, sorted=False
             ).indices
             accepted_indices = accepted_indices[keep]
+            score = score[keep]
 
         world = backproject_depth(best_depth, reference_camera)
         points = world.reshape(-1, 3)[accepted_indices]
@@ -1092,4 +1092,14 @@ class GaussianProAnchorBuilder:
             result.mean_consistent_views = float(
                 consistent_views.flatten()[accepted_indices].mean().item()
             )
+            view_confidence = (
+                consistent_views.flatten()[accepted_indices].float()
+                / max(1, len(sources))
+            ).clamp(0.0, 1.0)
+            photo_confidence = (
+                1.0 - best_cost.flatten()[accepted_indices]
+            ).clamp(0.0, 1.0)
+            self.last_point_confidence = (
+                0.6 * view_confidence + 0.4 * photo_confidence
+            ).clamp(0.0, 1.0)
         return result, points, point_normals

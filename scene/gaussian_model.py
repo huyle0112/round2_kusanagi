@@ -97,6 +97,11 @@ class GaussianModel:
 
         self.anchor_demon = torch.empty(0)
         self._gaussianpro_anchor_mask = torch.empty(0, dtype=torch.bool)
+        self._gaussianpro_confidence = torch.empty(0)
+        self._gaussianpro_observations = torch.empty(0)
+        self._gaussianpro_birth_iteration = torch.empty(
+            0, dtype=torch.long
+        )
                 
         self.optimizer = None
         self.percent_dense = 0
@@ -219,6 +224,23 @@ class GaussianModel:
     @property
     def get_anchor(self):
         return self._anchor
+
+    def _reset_gaussianpro_lifecycle(self):
+        count = int(self.get_anchor.shape[0])
+        device = self.get_anchor.device
+        self._gaussianpro_anchor_mask = torch.zeros(
+            count, dtype=torch.bool, device=device
+        )
+        # COLMAP anchors start trusted but can still be refined later.
+        self._gaussianpro_confidence = torch.ones(
+            count, dtype=torch.float32, device=device
+        )
+        self._gaussianpro_observations = torch.zeros(
+            count, dtype=torch.float32, device=device
+        )
+        self._gaussianpro_birth_iteration = torch.zeros(
+            count, dtype=torch.long, device=device
+        )
     
     @property
     def set_anchor(self, new_anchor):
@@ -281,6 +303,7 @@ class GaussianModel:
         self._gaussianpro_anchor_mask = torch.zeros(
             self.get_anchor.shape[0], dtype=torch.bool, device="cuda"
         )
+        self._reset_gaussianpro_lifecycle()
 
 
     def training_setup(self, training_args):
@@ -474,6 +497,7 @@ class GaussianModel:
         self._gaussianpro_anchor_mask = torch.zeros(
             self.get_anchor.shape[0], dtype=torch.bool, device="cuda"
         )
+        self._reset_gaussianpro_lifecycle()
 
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -588,6 +612,15 @@ class GaussianModel:
             self._gaussianpro_anchor_mask = self._gaussianpro_anchor_mask[
                 valid_points_mask
             ]
+            self._gaussianpro_confidence = self._gaussianpro_confidence[
+                valid_points_mask
+            ]
+            self._gaussianpro_observations = (
+                self._gaussianpro_observations[valid_points_mask]
+            )
+            self._gaussianpro_birth_iteration = (
+                self._gaussianpro_birth_iteration[valid_points_mask]
+            )
 
         self._anchor = optimizable_tensors["anchor"]
         self._offset = optimizable_tensors["offset"]
@@ -701,6 +734,8 @@ class GaussianModel:
         world_points,
         voxel_size=None,
         nearest_feature_chunk=64,
+        confidence=None,
+        birth_iteration=0,
     ):
         """Insert multi-view propagated points directly into the anchor grid.
 
@@ -828,11 +863,22 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
 
         new_count = int(new_anchor.shape[0])
+        old_count = int(anchors.shape[0])
         if self._gaussianpro_anchor_mask.numel() != anchors.shape[0]:
             self._gaussianpro_anchor_mask = torch.zeros(
-                anchors.shape[0],
+                old_count,
                 dtype=torch.bool,
                 device=new_anchor.device,
+            )
+        if self._gaussianpro_confidence.numel() != old_count:
+            self._gaussianpro_confidence = torch.ones(
+                old_count, dtype=torch.float32, device=new_anchor.device
+            )
+            self._gaussianpro_observations = torch.zeros(
+                old_count, dtype=torch.float32, device=new_anchor.device
+            )
+            self._gaussianpro_birth_iteration = torch.zeros(
+                old_count, dtype=torch.long, device=new_anchor.device
             )
         self._gaussianpro_anchor_mask = torch.cat(
             (
@@ -840,6 +886,44 @@ class GaussianModel:
                 torch.ones(
                     new_count,
                     dtype=torch.bool,
+                    device=new_anchor.device,
+                ),
+            )
+        )
+        if confidence is None or confidence.numel() == 0:
+            initial_confidence = torch.full(
+                (new_count,),
+                0.75,
+                dtype=torch.float32,
+                device=new_anchor.device,
+            )
+        else:
+            initial_confidence = torch.full(
+                (new_count,),
+                float(confidence.float().mean().item()),
+                dtype=torch.float32,
+                device=new_anchor.device,
+            )
+        self._gaussianpro_confidence = torch.cat(
+            (self._gaussianpro_confidence, initial_confidence)
+        )
+        self._gaussianpro_observations = torch.cat(
+            (
+                self._gaussianpro_observations,
+                torch.ones(
+                    new_count,
+                    dtype=torch.float32,
+                    device=new_anchor.device,
+                ),
+            )
+        )
+        self._gaussianpro_birth_iteration = torch.cat(
+            (
+                self._gaussianpro_birth_iteration,
+                torch.full(
+                    (new_count,),
+                    int(birth_iteration),
+                    dtype=torch.long,
                     device=new_anchor.device,
                 ),
             )
@@ -901,6 +985,157 @@ class GaussianModel:
             dim=0,
         )
         return new_count
+
+    @torch.no_grad()
+    def manage_gaussianpro_anchors(
+        self,
+        world_points,
+        confidence,
+        *,
+        iteration,
+        allow_add,
+        max_total_anchors,
+        voxel_size,
+        refine_radius,
+        refine_rate=0.1,
+        confidence_decay=0.995,
+        prune=False,
+        prune_confidence=0.25,
+        prune_opacity=0.01,
+        prune_grace_iterations=1000,
+    ):
+        """Refine, add, and optionally prune anchors using GP evidence."""
+        current_count = int(self.get_anchor.shape[0])
+        if self._gaussianpro_confidence.numel() != current_count:
+            self._reset_gaussianpro_lifecycle()
+
+        gp_mask = self._gaussianpro_anchor_mask
+        self._gaussianpro_confidence[gp_mask] *= float(confidence_decay)
+
+        refined_count = 0
+        added_count = 0
+        if world_points is not None and world_points.numel() > 0:
+            points = world_points.to(
+                device=self.get_anchor.device,
+                dtype=self.get_anchor.dtype,
+            )
+            if confidence is None or confidence.numel() != points.shape[0]:
+                point_confidence = torch.full(
+                    (points.shape[0],),
+                    0.75,
+                    dtype=torch.float32,
+                    device=points.device,
+                )
+            else:
+                point_confidence = confidence.to(
+                    device=points.device, dtype=torch.float32
+                )
+
+            nearest_indices = []
+            nearest_distances = []
+            anchors = self.get_anchor.detach()
+            anchor_norm = anchors.square().sum(dim=1).unsqueeze(0)
+            for start in range(0, points.shape[0], 64):
+                query = points[start : start + 64]
+                squared_distance = (
+                    query.square().sum(dim=1, keepdim=True)
+                    + anchor_norm
+                    - 2.0 * query @ anchors.transpose(0, 1)
+                ).clamp_min(0.0)
+                distance, index = squared_distance.min(dim=1)
+                nearest_indices.append(index)
+                nearest_distances.append(distance.sqrt())
+            nearest_indices = torch.cat(nearest_indices)
+            nearest_distances = torch.cat(nearest_distances)
+
+            refine_mask = nearest_distances <= float(refine_radius)
+            if refine_mask.any():
+                indices = nearest_indices[refine_mask]
+                samples = points[refine_mask]
+                weights = point_confidence[refine_mask].clamp(0.05, 1.0)
+                position_sum = torch.zeros_like(self.get_anchor)
+                weight_sum = torch.zeros(
+                    current_count,
+                    dtype=self.get_anchor.dtype,
+                    device=self.get_anchor.device,
+                )
+                position_sum.index_add_(
+                    0, indices, samples * weights.unsqueeze(1)
+                )
+                weight_sum.index_add_(0, indices, weights)
+                touched = weight_sum > 0
+                target = position_sum[touched] / weight_sum[touched, None]
+                update_rate = (
+                    float(refine_rate)
+                    * weight_sum[touched].clamp(max=1.0)
+                ).unsqueeze(1)
+                self._anchor.data[touched].lerp_(target, update_rate)
+
+                confidence_sum = torch.zeros_like(
+                    self._gaussianpro_confidence
+                )
+                observation_sum = torch.zeros_like(
+                    self._gaussianpro_observations
+                )
+                confidence_sum.index_add_(0, indices, weights)
+                observation_sum.index_add_(
+                    0, indices, torch.ones_like(weights)
+                )
+                evidence = confidence_sum[touched] / observation_sum[
+                    touched
+                ].clamp_min(1.0)
+                self._gaussianpro_confidence[touched] = (
+                    0.8 * self._gaussianpro_confidence[touched]
+                    + 0.2 * evidence
+                )
+                self._gaussianpro_observations += observation_sum
+                refined_count = int(touched.sum().item())
+
+            add_mask = ~refine_mask
+            remaining_budget = max(
+                0, int(max_total_anchors) - int(self.get_anchor.shape[0])
+            )
+            if allow_add and remaining_budget > 0 and add_mask.any():
+                add_indices = torch.nonzero(
+                    add_mask, as_tuple=False
+                ).squeeze(1)[:remaining_budget]
+                added_count = self.add_propagated_anchors(
+                    points[add_indices],
+                    voxel_size=voxel_size,
+                    confidence=point_confidence[add_indices],
+                    birth_iteration=iteration,
+                )
+
+        pruned_count = 0
+        if prune and self._gaussianpro_anchor_mask.any():
+            age = iteration - self._gaussianpro_birth_iteration
+            opacity = self.get_opacity.detach().squeeze(-1)
+            prune_mask = (
+                self._gaussianpro_anchor_mask
+                & (age >= int(prune_grace_iterations))
+                & (self._gaussianpro_confidence < float(prune_confidence))
+                & (opacity < float(prune_opacity))
+            )
+            pruned_count = int(prune_mask.sum().item())
+            if pruned_count:
+                offset_keep = (
+                    ~prune_mask
+                ).unsqueeze(1).expand(-1, self.n_offsets).reshape(-1)
+                self.offset_denom = self.offset_denom[offset_keep]
+                self.offset_gradient_accum = self.offset_gradient_accum[
+                    offset_keep
+                ]
+                self.opacity_accum = self.opacity_accum[~prune_mask]
+                self.anchor_demon = self.anchor_demon[~prune_mask]
+                self.max_radii2D = self.max_radii2D[~prune_mask]
+                self.prune_anchor(prune_mask)
+
+        return {
+            "added": added_count,
+            "refined": refined_count,
+            "pruned": pruned_count,
+            "total": int(self.get_anchor.shape[0]),
+        }
 
     def gaussianpro_feature_loss(self, sample_count=512):
         """Keep propagated latent features locally coherent while they learn.

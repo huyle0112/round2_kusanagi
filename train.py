@@ -71,12 +71,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gaussians.restore(model_params, opt)
 
     gaussianpro = None
-    gaussianpro_stop_iteration = min(
-        opt.gaussianpro_until_iter,
-        max(
-            opt.gaussianpro_start_iter + 1,
-            opt.iterations - opt.gaussianpro_final_refine_iters,
-        ),
+    gaussianpro_initial_anchors = int(gaussians.get_anchor.shape[0])
+    gaussianpro_max_anchors = int(
+        gaussianpro_initial_anchors * opt.gaussianpro_max_anchor_multiplier
     )
     if opt.use_gaussianpro:
         if opt.gaussianpro_voxel_factor <= 0:
@@ -86,10 +83,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 "gaussianpro_min_consistent_views cannot exceed "
                 "gaussianpro_neighbors"
             )
-        if opt.gaussianpro_start_iter >= gaussianpro_stop_iteration:
+        if not (
+            opt.gaussianpro_start_iter
+            < opt.gaussianpro_add_until_iter
+            <= opt.gaussianpro_refine_until_iter
+            < opt.iterations
+        ):
             raise ValueError(
-                "GaussianPro needs a non-empty propagation window before "
-                "the final refinement iterations"
+                "GaussianPro schedule must satisfy start < add_until <= "
+                "refine_until < iterations"
             )
         gaussianpro = GaussianProAnchorBuilder(
             scene.getTrainCameras(),
@@ -131,10 +133,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             "GaussianPro anchor growth enabled: "
             f"{len(graph_sizes)} reference cameras, "
             f"{graph_mean:.1f} neighbours/reference, "
-            f"iterations {opt.gaussianpro_start_iter}-"
-            f"{gaussianpro_stop_iteration}, "
+            f"add {opt.gaussianpro_start_iter}-"
+            f"{opt.gaussianpro_add_until_iter}, refine until "
+            f"{opt.gaussianpro_refine_until_iter}, "
             f"interval {opt.gaussianpro_interval}, "
-            f"downsample {opt.gaussianpro_downsample}"
+            f"downsample {opt.gaussianpro_downsample}, "
+            f"anchor budget {gaussianpro_max_anchors}"
         )
         if logger:
             logger.info(message)
@@ -173,13 +177,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         gaussianpro_result = None
+        gaussianpro_lifecycle = None
         gaussianpro_step = (
             gaussianpro is not None
             and iteration >= opt.gaussianpro_start_iter
-            and iteration < gaussianpro_stop_iteration
+            and iteration < opt.gaussianpro_refine_until_iter
             and iteration % max(1, opt.gaussianpro_interval) == 0
         )
         if gaussianpro_step:
+            gaussianpro_allow_add = (
+                iteration < opt.gaussianpro_add_until_iter
+            )
             reference_camera = gaussianpro.next_reference()
             gaussianpro_result, proposed_points, _proposed_normals = (
                 gaussianpro.run(
@@ -189,22 +197,43 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     background,
                     render,
                     prefilter_voxel,
+                    require_new_anchor=gaussianpro_allow_add,
                 )
             )
-            if proposed_points is not None:
-                gaussianpro_result.added_count = (
-                    gaussians.add_propagated_anchors(
-                        proposed_points,
-                        voxel_size=(
-                            gaussians.voxel_size
-                            * opt.gaussianpro_voxel_factor
-                        ),
+            gaussianpro_lifecycle = gaussians.manage_gaussianpro_anchors(
+                proposed_points,
+                gaussianpro.last_point_confidence,
+                iteration=iteration,
+                allow_add=gaussianpro_allow_add,
+                max_total_anchors=gaussianpro_max_anchors,
+                voxel_size=(
+                    gaussians.voxel_size
+                    * opt.gaussianpro_voxel_factor
+                ),
+                refine_radius=(
+                    gaussians.voxel_size
+                    * opt.gaussianpro_refine_radius_factor
+                ),
+                refine_rate=opt.gaussianpro_refine_rate,
+                confidence_decay=opt.gaussianpro_confidence_decay,
+                prune=(
+                    iteration % max(
+                        1, opt.gaussianpro_prune_interval
                     )
-                )
+                    == 0
+                ),
+                prune_confidence=opt.gaussianpro_prune_confidence,
+                prune_opacity=opt.gaussianpro_prune_opacity,
+                prune_grace_iterations=(
+                    opt.gaussianpro_prune_grace_iters
+                ),
+            )
+            gaussianpro_result.added_count = gaussianpro_lifecycle["added"]
             if logger:
                 logger.info(
                     "[ITER %d] Propagation %s: candidates=%d, "
-                    "photo=%d, consistent=%d, proposed=%d, added=%d, "
+                    "photo=%d, consistent=%d, proposed=%d, "
+                    "added=%d, refined=%d, pruned=%d, total=%d, "
                     "photo_error=%.4f, views=%.2f",
                     iteration,
                     gaussianpro_result.reference_name,
@@ -213,6 +242,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     gaussianpro_result.consistent_count,
                     gaussianpro_result.proposed_count,
                     gaussianpro_result.added_count,
+                    gaussianpro_lifecycle["refined"],
+                    gaussianpro_lifecycle["pruned"],
+                    gaussianpro_lifecycle["total"],
                     gaussianpro_result.mean_photo_error,
                     gaussianpro_result.mean_consistent_views,
                 )
@@ -229,6 +261,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gaussianpro_active = (
             gaussianpro is not None
             and iteration >= opt.gaussianpro_start_iter
+            and iteration < opt.gaussianpro_refine_until_iter
         )
         gaussianpro_plane_step = (
             gaussianpro_active
@@ -269,10 +302,20 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             gaussianpro_flatness_ratio = (
                 sorted_scaling[:, 0] / sorted_scaling[:, 1].clamp_min(1e-8)
             ).mean()
+            flatness_penalty = (
+                F.relu(
+                    gaussianpro_flatness_ratio
+                    - opt.gaussianpro_flatness_target
+                )
+                + F.relu(
+                    opt.gaussianpro_flatness_floor
+                    - gaussianpro_flatness_ratio
+                )
+            )
             loss = (
                 loss
                 + opt.lambda_gaussianpro_flatness
-                * gaussianpro_flatness_ratio
+                * flatness_penalty
             )
             if iteration % max(1, opt.gaussianpro_feature_interval) == 0:
                 (
@@ -366,6 +409,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     )
                 if gaussianpro_result is not None:
                     postfix["GP-add"] = gaussianpro_result.added_count
+                    postfix["GP-ref"] = gaussianpro_lifecycle["refined"]
+                    postfix["GP-del"] = gaussianpro_lifecycle["pruned"]
                     postfix["GP-cons"] = (
                         gaussianpro_result.consistent_count
                     )
@@ -411,6 +456,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         iteration,
                     )
                     tb_writer.add_scalar(
+                        f"{dataset_name}/gaussianpro/refined",
+                        gaussianpro_lifecycle["refined"],
+                        iteration,
+                    )
+                    tb_writer.add_scalar(
+                        f"{dataset_name}/gaussianpro/pruned",
+                        gaussianpro_lifecycle["pruned"],
+                        iteration,
+                    )
+                    tb_writer.add_scalar(
                         f"{dataset_name}/gaussianpro/photo_error",
                         gaussianpro_result.mean_photo_error,
                         iteration,
@@ -424,7 +479,24 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, opt.lambda_dssim, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
+            training_report(
+                tb_writer,
+                dataset_name,
+                iteration,
+                Ll1,
+                loss,
+                l1_loss,
+                opt.lambda_dssim,
+                iter_start.elapsed_time(iter_end),
+                testing_iterations,
+                scene,
+                render,
+                (pipe, background),
+                wandb,
+                logger,
+                validation_sample_count=getattr(dataset, "validation_sample_count", 0),
+                validation_seed=getattr(dataset, "validation_seed", 42),
+            )
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -436,15 +508,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 
                 # densification
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
-                    gaussians.adjust_anchor(
-                        check_interval=opt.update_interval,
-                        success_threshold=opt.success_threshold,
-                        grad_threshold=opt.densify_grad_threshold,
-                        min_opacity=opt.min_opacity,
-                        grow=not opt.use_gaussianpro,
-                    )
+                    if not opt.use_gaussianpro:
+                        gaussians.adjust_anchor(
+                            check_interval=opt.update_interval,
+                            success_threshold=opt.success_threshold,
+                            grad_threshold=opt.densify_grad_threshold,
+                            min_opacity=opt.min_opacity,
+                        )
             cleanup_iteration = (
-                gaussianpro_stop_iteration
+                opt.gaussianpro_refine_until_iter
                 if gaussianpro is not None
                 else opt.update_until
             )
@@ -495,7 +567,24 @@ def _append_monitor_row(path, fieldnames, row):
         writer.writerow(row)
 
 
-def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, lambda_dssim, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None):
+def training_report(
+    tb_writer,
+    dataset_name,
+    iteration,
+    Ll1,
+    loss,
+    l1_loss,
+    lambda_dssim,
+    elapsed,
+    testing_iterations,
+    scene: Scene,
+    renderFunc,
+    renderArgs,
+    wandb=None,
+    logger=None,
+    validation_sample_count=0,
+    validation_seed=42,
+):
     if tb_writer:
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/pixel_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
@@ -527,13 +616,29 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, lamb
         torch.cuda.empty_cache()
         train_cameras = scene.getTrainCameras()
         val_cameras = scene.getTestCameras()
-        train_sample_size = min(
-            len(train_cameras),
-            max(1, len(val_cameras)),
-        )
-        train_eval_cameras = random.Random(42).sample(
-            train_cameras, train_sample_size
-        )
+        if not val_cameras and validation_sample_count > 0:
+            # Proxy validation: all cameras remain available for optimization.
+            # We only select fixed cameras for repeatable metric monitoring.
+            sample_count = min(validation_sample_count, len(train_cameras))
+            rng = random.Random(validation_seed)
+            val_cameras = rng.sample(train_cameras, sample_count)
+            val_ids = {id(camera) for camera in val_cameras}
+            remaining = [
+                camera for camera in train_cameras
+                if id(camera) not in val_ids
+            ]
+            train_pool = remaining if len(remaining) >= sample_count else train_cameras
+            train_eval_cameras = rng.sample(
+                train_pool, min(sample_count, len(train_pool))
+            )
+        else:
+            train_sample_size = min(
+                len(train_cameras),
+                max(1, len(val_cameras)),
+            )
+            train_eval_cameras = random.Random(validation_seed).sample(
+                train_cameras, train_sample_size
+            )
         validation_configs = (
             {"name": "train_eval", "cameras": train_eval_cameras},
             {"name": "val", "cameras": val_cameras},

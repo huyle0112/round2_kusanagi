@@ -68,6 +68,10 @@ class ModelParams(ParamGroup):
         # validation/ablation runs with ground truth.
         self.validation_ratio = 0.0
         self.validation_seed = 42
+        # When validation_ratio is zero, metrics can still be monitored on a
+        # deterministic sample of training cameras without withholding them.
+        # A value of zero disables this proxy-validation mode.
+        self.validation_sample_count = 0
         # Undistort SIMPLE_RADIAL inputs for the pinhole rasterizer and warp
         # renders back to the raw camera domain when exporting.
         self.correct_radial_distortion = False
@@ -167,8 +171,9 @@ class OptimizationParams(ParamGroup):
         # multi-view geometry throughout training while Scaffold-GS continues
         # to optimize and prune the resulting anchors.
         self.use_gaussianpro = False
-        self.gaussianpro_start_iter = 1500
-        self.gaussianpro_until_iter = 30_000
+        self.gaussianpro_start_iter = 3000
+        self.gaussianpro_add_until_iter = 15_000
+        self.gaussianpro_refine_until_iter = 24_000
         self.gaussianpro_interval = 50
         self.gaussianpro_neighbors = 4
         self.gaussianpro_graph_samples = 4096
@@ -178,24 +183,33 @@ class OptimizationParams(ParamGroup):
         self.gaussianpro_patchmatch_iterations = 3
         self.gaussianpro_opacity_threshold = 0.5
         self.gaussianpro_coverage_threshold = 0.5
-        self.gaussianpro_min_consistent_views = 2
-        self.gaussianpro_max_photo_error = 0.35
+        self.gaussianpro_min_consistent_views = 3
+        self.gaussianpro_max_photo_error = 0.25
         self.gaussianpro_reprojection_threshold = 2.0
         self.gaussianpro_depth_consistency_threshold = 0.03
         self.gaussianpro_normal_consistency_threshold = 0.5
         self.gaussianpro_depth_discrepancy_threshold = 0.20
-        self.gaussianpro_max_anchors_per_step = 512
-        self.gaussianpro_voxel_factor = 0.75
+        self.gaussianpro_max_anchors_per_step = 128
+        self.gaussianpro_voxel_factor = 1.0
         self.gaussianpro_seed = 42
-        self.gaussianpro_final_refine_iters = 500
+        self.gaussianpro_max_anchor_multiplier = 1.25
+        self.gaussianpro_refine_radius_factor = 1.5
+        self.gaussianpro_refine_rate = 0.1
+        self.gaussianpro_confidence_decay = 0.995
+        self.gaussianpro_prune_interval = 500
+        self.gaussianpro_prune_confidence = 0.25
+        self.gaussianpro_prune_opacity = 0.01
+        self.gaussianpro_prune_grace_iters = 1000
 
-        # Geometry supervision for propagated anchors. The scale-ratio loss
-        # avoids the covariance collapse caused by penalizing raw scale.
-        self.lambda_gaussianpro_flatness = 0.01
-        self.lambda_gaussianpro_normal_l1 = 0.005
-        self.lambda_gaussianpro_normal_cos = 0.005
-        self.lambda_gaussianpro_feature_l1 = 0.001
-        self.lambda_gaussianpro_feature_cos = 0.001
+        # Geometry supervision stops at refine_until. Flatness is a hinge
+        # target, so ratios below the target are not pushed towards zero.
+        self.gaussianpro_flatness_target = 0.20
+        self.gaussianpro_flatness_floor = 0.02
+        self.lambda_gaussianpro_flatness = 0.001
+        self.lambda_gaussianpro_normal_l1 = 0.001
+        self.lambda_gaussianpro_normal_cos = 0.001
+        self.lambda_gaussianpro_feature_l1 = 0.0002
+        self.lambda_gaussianpro_feature_cos = 0.0002
         self.gaussianpro_feature_interval = 4
         self.gaussianpro_feature_samples = 512
 

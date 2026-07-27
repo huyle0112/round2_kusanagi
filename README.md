@@ -158,16 +158,17 @@ Enable the unified GaussianPro anchor-growth path with:
 ```bash
 python train.py -s <scene> -m <output> --appearance_dim 0 \
   --use_gaussianpro \
-  --gaussianpro_start_iter 1500 \
-  --gaussianpro_until_iter 30000 \
+  --gaussianpro_start_iter 3000 \
+  --gaussianpro_add_until_iter 15000 \
+  --gaussianpro_refine_until_iter 24000 \
   --gaussianpro_interval 50 \
   --gaussianpro_neighbors 4 \
   --gaussianpro_downsample 4
 ```
 
-GaussianPro replaces Scaffold-GS gradient-based anchor growth while leaving
-its renderer, neural Gaussian decoders, optimizer, photometric loss, and
-opacity pruning intact. It builds a neighbour graph from camera pose and shared anchor
+GaussianPro replaces Scaffold-GS gradient-based anchor growth and pruning
+while leaving its renderer, neural Gaussian decoders, optimizer, and
+photometric loss intact. It builds a neighbour graph from camera pose and shared anchor
 visibility, rather than filename order. At each propagation event it renders
 the reference plus overlapping source views, splats source depth hypotheses
 into the reference, performs normalized multi-view patch matching, propagates
@@ -176,11 +177,17 @@ round-trip reprojection consistency. Accepted points are snapped to the
 Scaffold voxel grid, deduplicated, initialized by four-neighbour latent-feature
 interpolation, and appended together with valid Adam and densification state.
 
-The new anchors immediately receive the original L1+DSSIM image loss. Cached
-propagated normals add L1 and cosine geometry supervision, while a normalized
-scale-ratio loss encourages planar Gaussians without collapsing raw scale.
-Propagation continues until `gaussianpro_until_iter`, capped so the final
-`gaussianpro_final_refine_iters` optimize the last anchors before saving.
+Consistent samples first refine nearby anchors; only uncovered samples may
+create anchors, subject to a per-step limit and a total multiplier over the
+initial COLMAP anchor count. GaussianPro-created anchors track confidence,
+observation count, and age, and are pruned only when both geometric confidence
+and opacity are low. Addition stops at `gaussianpro_add_until_iter`, geometry
+refinement stops at `gaussianpro_refine_until_iter`, and the remaining
+iterations optimize a fixed Scaffold-GS topology.
+
+The anchors receive the original L1+DSSIM image loss. Cached propagated
+normals add L1 and cosine supervision. A bounded scale-ratio loss encourages
+planarity but stops pushing once the ratio enters the configured range.
 
 Full COLMAP `fx/fy/cx/cy` intrinsics are used by propagation and raster
 projection. Look for `GP-add` and `GP-cons` in the training log. Persistent
