@@ -156,6 +156,13 @@ class OptimizationParams(ParamGroup):
 
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+        self.lambda_edge_init = 0.0
+        self.lambda_edge_final = 0.0
+        self.edge_loss_start_iter = 1000
+        self.edge_top_weight = 1.15
+        self.edge_border_weight = 1.10
+        self.edge_blur_floor = 0.35
+        self.edge_block_size = 64
         
         # for anchor densification
         self.start_stat = 500
@@ -188,20 +195,24 @@ class OptimizationParams(ParamGroup):
         # the nearest/farthest depth quantiles and the image periphery.
         self.gaussianpro_adaptive_views = True
         self.gaussianpro_relaxed_min_views = 2
-        self.gaussianpro_near_quantile = 0.20
-        self.gaussianpro_far_quantile = 0.80
-        self.gaussianpro_edge_radius = 0.75
+        self.gaussianpro_near_quantile = 0.10
+        self.gaussianpro_far_quantile = 0.90
+        self.gaussianpro_edge_radius = 0.90
         self.gaussianpro_max_photo_error = 0.25
         self.gaussianpro_reprojection_threshold = 2.0
         self.gaussianpro_depth_consistency_threshold = 0.03
         self.gaussianpro_normal_consistency_threshold = 0.5
         self.gaussianpro_depth_discrepancy_threshold = 0.20
+        self.gaussianpro_edge_residual_priority = 0.5
         self.gaussianpro_max_anchors_per_step = 128
         self.gaussianpro_voxel_factor = 1.0
         self.gaussianpro_seed = 42
         self.gaussianpro_max_anchor_multiplier = 1.25
         self.gaussianpro_refine_radius_factor = 1.5
         self.gaussianpro_refine_rate = 0.1
+        # Preserve the trusted Scaffold/COLMAP population. Nearby GaussianPro
+        # evidence supports it but only moves anchors created by GaussianPro.
+        self.gaussianpro_refine_scaffold_anchors = False
         self.gaussianpro_confidence_decay = 0.995
         self.gaussianpro_prune_interval = 500
         self.gaussianpro_prune_confidence = 0.25

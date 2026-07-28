@@ -20,6 +20,88 @@ def l1_loss(network_output, gt):
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 
+def edge_aware_loss(
+    network_output,
+    gt,
+    top_weight=1.15,
+    border_weight=1.10,
+    top_fraction=0.20,
+    border_fraction=0.15,
+    blur_floor=0.35,
+    block_size=64,
+):
+    """Weighted first/second-order loss with conservative blur reliability.
+
+    Spatial emphasis is applied only to gradients. Low-gradient blocks receive
+    less weight, preventing a locally blurred observation from teaching a soft
+    edge while retaining its RGB/SSIM supervision and camera geometry.
+    """
+    pred_gray = network_output.mean(dim=0, keepdim=True)
+    gt_gray = gt.mean(dim=0, keepdim=True)
+    height, width = gt_gray.shape[-2:]
+
+    gt_dx = gt_gray[..., :, 1:] - gt_gray[..., :, :-1]
+    gt_dy = gt_gray[..., 1:, :] - gt_gray[..., :-1, :]
+    pred_dx = pred_gray[..., :, 1:] - pred_gray[..., :, :-1]
+    pred_dy = pred_gray[..., 1:, :] - pred_gray[..., :-1, :]
+
+    with torch.no_grad():
+        magnitude = torch.zeros_like(gt_gray)
+        magnitude[..., :, 1:] += gt_dx.abs()
+        magnitude[..., 1:, :] += gt_dy.abs()
+        kernel = max(1, min(int(block_size), height, width))
+        local_energy = F.avg_pool2d(
+            magnitude.unsqueeze(0),
+            kernel_size=kernel,
+            stride=kernel,
+            ceil_mode=True,
+        )
+        positive = local_energy[local_energy > 0]
+        threshold = (
+            torch.quantile(positive, 0.20)
+            if positive.numel()
+            else local_energy.new_tensor(0.0)
+        )
+        reliability = torch.where(
+            local_energy <= threshold,
+            local_energy.new_tensor(float(blur_floor)),
+            local_energy.new_tensor(1.0),
+        )
+        reliability = F.interpolate(
+            reliability,
+            size=(height, width),
+            mode="nearest",
+        ).squeeze(0)
+
+        spatial = torch.ones_like(gt_gray)
+        top_rows = max(1, int(round(height * float(top_fraction))))
+        border_x = max(1, int(round(width * float(border_fraction))))
+        border_y = max(1, int(round(height * float(border_fraction))))
+        spatial[..., :top_rows, :] *= float(top_weight)
+        spatial[..., :, :border_x] *= float(border_weight)
+        spatial[..., :, width - border_x :] *= float(border_weight)
+        spatial[..., :border_y, :] *= float(border_weight)
+        spatial[..., height - border_y :, :] *= float(border_weight)
+        weight = spatial * reliability
+
+    first_order = (
+        ((pred_dx - gt_dx).abs() * weight[..., :, 1:]).mean()
+        + ((pred_dy - gt_dy).abs() * weight[..., 1:, :]).mean()
+    )
+    laplacian_kernel = gt_gray.new_tensor(
+        [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]
+    ).view(1, 1, 3, 3)
+    pred_laplacian = F.conv2d(
+        pred_gray.unsqueeze(0), laplacian_kernel, padding=1
+    ).squeeze(0)
+    gt_laplacian = F.conv2d(
+        gt_gray.unsqueeze(0), laplacian_kernel, padding=1
+    ).squeeze(0)
+    second_order = (
+        (pred_laplacian - gt_laplacian).abs() * weight
+    ).mean()
+    return first_order + 0.5 * second_order
+
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
     return gauss / gauss.sum()

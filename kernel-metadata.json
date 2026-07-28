@@ -1,0 +1,20 @@
+{
+  "id": "acomingz/gaussianpro-sharp-full-dataset",
+  "title": "GaussianPro Sharp Full Dataset 30k",
+  "code_file": "kaggle_gaussianpro_sharp_filter_30k.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "keywords": ["gaussian-splatting", "gaussianpro", "blur-filter"],
+  "dataset_sources": [
+    "acomingz/maindataset",
+    "acomingz/gaussianpro-training-source"
+  ],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": [],
+  "machine_shape": "NvidiaTeslaT4"
+}

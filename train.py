@@ -35,7 +35,7 @@ import torchvision.transforms.functional as tf
 import lpipsPyTorch as lpips
 import random
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import edge_aware_loss, l1_loss, ssim
 from utils.gaussianpro import GaussianProAnchorBuilder
 from gaussian_renderer import prefilter_voxel, render, network_gui
 import sys
@@ -153,6 +153,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             depth_discrepancy_threshold=(
                 opt.gaussianpro_depth_discrepancy_threshold
             ),
+            edge_residual_priority=(
+                opt.gaussianpro_edge_residual_priority
+            ),
             max_anchors_per_step=opt.gaussianpro_max_anchors_per_step,
             min_proposals_per_step=1,
             use_plane_ncc=True,
@@ -256,6 +259,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     * opt.gaussianpro_refine_radius_factor
                 ),
                 refine_rate=opt.gaussianpro_refine_rate,
+                refine_scaffold_anchors=(
+                    opt.gaussianpro_refine_scaffold_anchors
+                ),
                 confidence_decay=opt.gaussianpro_confidence_decay,
                 prune=(
                     iteration % max(
@@ -274,7 +280,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 logger.info(
                     "[ITER %d] Propagation %s: candidates=%d, "
                     "photo=%d, consistent=%d, proposed=%d, "
-                    "added=%d, refined=%d, pruned=%d, total=%d, "
+                    "added=%d, refined=%d, scaffold_supported=%d, "
+                    "pruned=%d, gp=%d, scaffold=%d, total=%d, "
                     "photo_error=%.4f, views=%.2f",
                     iteration,
                     gaussianpro_result.reference_name,
@@ -284,7 +291,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     gaussianpro_result.proposed_count,
                     gaussianpro_result.added_count,
                     gaussianpro_lifecycle["refined"],
+                    gaussianpro_lifecycle["scaffold_supported"],
                     gaussianpro_lifecycle["pruned"],
+                    gaussianpro_lifecycle["gaussianpro_total"],
+                    gaussianpro_lifecycle["scaffold_total"],
                     gaussianpro_lifecycle["total"],
                     gaussianpro_result.mean_photo_error,
                     gaussianpro_result.mean_consistent_views,
@@ -331,6 +341,34 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+        edge_loss_value = None
+        edge_lambda = 0.0
+        if (
+            iteration >= opt.edge_loss_start_iter
+            and (
+                opt.lambda_edge_init > 0
+                or opt.lambda_edge_final > 0
+            )
+        ):
+            edge_progress = (
+                (iteration - opt.edge_loss_start_iter)
+                / max(1, opt.iterations - opt.edge_loss_start_iter)
+            )
+            edge_progress = min(1.0, max(0.0, edge_progress))
+            edge_lambda = (
+                opt.lambda_edge_init
+                + edge_progress
+                * (opt.lambda_edge_final - opt.lambda_edge_init)
+            )
+            edge_loss_value = edge_aware_loss(
+                image,
+                gt_image,
+                top_weight=opt.edge_top_weight,
+                border_weight=opt.edge_border_weight,
+                blur_floor=opt.edge_blur_floor,
+                block_size=opt.edge_block_size,
+            )
+            loss = loss + edge_lambda * edge_loss_value
 
         gaussianpro_flatness_ratio = None
         gaussianpro_normal_l1 = None
@@ -457,6 +495,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 postfix = {"Loss": f"{ema_loss_for_log:.{7}f}"}
                 if gaussianpro_flatness_ratio is not None:
                     postfix["GP-ratio"] = f"{gaussianpro_flatness_ratio.item():.3f}"
+                if edge_loss_value is not None:
+                    postfix["Edge"] = f"{edge_loss_value.item():.4f}"
                 if gaussianpro_normal_l1 is not None:
                     postfix["GPF-l1"] = (
                         f"{gaussianpro_normal_l1.item():.4f}"
@@ -580,7 +620,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         == 0
                     )
                     if not opt.use_gaussianpro or scaffold_fallback_step:
-                        gaussians.adjust_anchor(
+                        scaffold_added = gaussians.adjust_anchor(
                             check_interval=(
                                 opt.gaussianpro_scaffold_fallback_interval
                                 if opt.use_gaussianpro
@@ -596,7 +636,25 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                                 if opt.use_gaussianpro
                                 else opt.min_opacity
                             ),
+                            max_total_anchors=(
+                                gaussianpro_max_anchors
+                                if opt.use_gaussianpro
+                                else None
+                            ),
                         )
+                        if (
+                            opt.use_gaussianpro
+                            and scaffold_added > 0
+                            and logger
+                        ):
+                            logger.info(
+                                "[ITER %d] Scaffold fallback added=%d, "
+                                "total=%d/%d",
+                                iteration,
+                                scaffold_added,
+                                int(gaussians.get_anchor.shape[0]),
+                                gaussianpro_max_anchors,
+                            )
             cleanup_iteration = (
                 opt.gaussianpro_refine_until_iter
                 if gaussianpro is not None

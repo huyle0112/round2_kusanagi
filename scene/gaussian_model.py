@@ -630,10 +630,21 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
     
-    def anchor_growing(self, grads, threshold, offset_mask):
+    def anchor_growing(
+        self,
+        grads,
+        threshold,
+        offset_mask,
+        max_total_anchors=None,
+    ):
         ## 
         init_length = self.get_anchor.shape[0]*self.n_offsets
         for i in range(self.update_depth):
+            if (
+                max_total_anchors is not None
+                and self.get_anchor.shape[0] >= int(max_total_anchors)
+            ):
+                break
             # update threshold
             cur_threshold = threshold*((self.update_hierachy_factor//2)**i)
             # mask from grad threshold
@@ -683,6 +694,12 @@ class GaussianModel:
 
             remove_duplicates = ~remove_duplicates
             candidate_anchor = selected_grid_coords_unique[remove_duplicates]*cur_size
+            if max_total_anchors is not None:
+                remaining_budget = max(
+                    0,
+                    int(max_total_anchors) - int(self.get_anchor.shape[0]),
+                )
+                candidate_anchor = candidate_anchor[:remaining_budget]
 
             
             if candidate_anchor.shape[0] > 0:
@@ -696,6 +713,7 @@ class GaussianModel:
                 new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
 
                 new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
+                new_feat = new_feat[:candidate_anchor.shape[0]]
 
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
 
@@ -998,6 +1016,7 @@ class GaussianModel:
         voxel_size,
         refine_radius,
         refine_rate=0.1,
+        refine_scaffold_anchors=False,
         confidence_decay=0.995,
         prune=False,
         prune_confidence=0.25,
@@ -1048,7 +1067,18 @@ class GaussianModel:
             nearest_indices = torch.cat(nearest_indices)
             nearest_distances = torch.cat(nearest_distances)
 
-            refine_mask = nearest_distances <= float(refine_radius)
+            near_existing = nearest_distances <= float(refine_radius)
+            nearest_is_gaussianpro = self._gaussianpro_anchor_mask[
+                nearest_indices
+            ]
+            # GaussianPro proposals must not drag trusted COLMAP/Scaffold
+            # anchors. Evidence close to that population is treated as
+            # already covered; only the GP population is position-fused.
+            refine_mask = near_existing & (
+                nearest_is_gaussianpro
+                | bool(refine_scaffold_anchors)
+            )
+            scaffold_supported_mask = near_existing & ~refine_mask
             if refine_mask.any():
                 indices = nearest_indices[refine_mask]
                 samples = points[refine_mask]
@@ -1091,7 +1121,10 @@ class GaussianModel:
                 self._gaussianpro_observations += observation_sum
                 refined_count = int(touched.sum().item())
 
-            add_mask = ~refine_mask
+            # Add only when neither population already covers the proposal.
+            # In particular, do not create a duplicate GP anchor beside a
+            # protected Scaffold anchor merely because it was not refined.
+            add_mask = ~near_existing
             remaining_budget = max(
                 0, int(max_total_anchors) - int(self.get_anchor.shape[0])
             )
@@ -1130,11 +1163,22 @@ class GaussianModel:
                 self.max_radii2D = self.max_radii2D[~prune_mask]
                 self.prune_anchor(prune_mask)
 
+        gaussianpro_total = int(
+            self._gaussianpro_anchor_mask.sum().item()
+        )
+        total = int(self.get_anchor.shape[0])
         return {
             "added": added_count,
             "refined": refined_count,
+            "scaffold_supported": (
+                int(scaffold_supported_mask.sum().item())
+                if world_points is not None and world_points.numel() > 0
+                else 0
+            ),
             "pruned": pruned_count,
-            "total": int(self.get_anchor.shape[0]),
+            "gaussianpro_total": gaussianpro_total,
+            "scaffold_total": total - gaussianpro_total,
+            "total": total,
         }
 
     def gaussianpro_feature_loss(self, sample_count=512):
@@ -1155,21 +1199,24 @@ class GaussianModel:
         selected = torch.nonzero(
             self._gaussianpro_anchor_mask, as_tuple=False
         ).squeeze(1)
+        scaffold_indices = torch.nonzero(
+            ~self._gaussianpro_anchor_mask, as_tuple=False
+        ).squeeze(1)
+        if scaffold_indices.numel() == 0:
+            zero = self._anchor_feat.sum() * 0.0
+            return zero, zero
         if selected.numel() > sample_count:
             order = torch.randperm(selected.numel(), device=selected.device)
             selected = selected[order[:sample_count]]
 
         query = self.get_anchor.detach()[selected]
-        anchors = self.get_anchor.detach()
+        scaffold_anchors = self.get_anchor.detach()[scaffold_indices]
         squared_distance = (
             query.square().sum(dim=1, keepdim=True)
-            + anchors.square().sum(dim=1).unsqueeze(0)
-            - 2.0 * query @ anchors.transpose(0, 1)
+            + scaffold_anchors.square().sum(dim=1).unsqueeze(0)
+            - 2.0 * query @ scaffold_anchors.transpose(0, 1)
         ).clamp_min(0.0)
-        squared_distance[
-            torch.arange(selected.numel(), device=selected.device), selected
-        ] = torch.inf
-        neighbour_count = min(4, self.get_anchor.shape[0] - 1)
+        neighbour_count = min(4, int(scaffold_indices.numel()))
         distances, indices = torch.topk(
             squared_distance,
             k=neighbour_count,
@@ -1182,7 +1229,8 @@ class GaussianModel:
         ).reciprocal()
         weights = weights / weights.sum(dim=1, keepdim=True)
         target = (
-            self._anchor_feat.detach()[indices] * weights.unsqueeze(-1)
+            self._anchor_feat.detach()[scaffold_indices[indices]]
+            * weights.unsqueeze(-1)
         ).sum(dim=1)
         feature = self._anchor_feat[selected]
         l1 = (feature - target).abs().mean()
@@ -1200,8 +1248,10 @@ class GaussianModel:
         grad_threshold=0.0002,
         min_opacity=0.005,
         grow=True,
+        max_total_anchors=None,
     ):
         anchor_count_before_growth = int(self.get_anchor.shape[0])
+        scaffold_added = 0
         # # adding anchors
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
@@ -1209,7 +1259,12 @@ class GaussianModel:
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
         
         if grow:
-            self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+            self.anchor_growing(
+                grads_norm,
+                grad_threshold,
+                offset_mask,
+                max_total_anchors=max_total_anchors,
+            )
             scaffold_added = (
                 int(self.get_anchor.shape[0]) - anchor_count_before_growth
             )
@@ -1304,6 +1359,7 @@ class GaussianModel:
             self.prune_anchor(prune_mask)
         
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        return scaffold_added
 
     def save_mlp_checkpoints(self, path, mode = 'split'):#split or unite
         mkdir_p(os.path.dirname(path))

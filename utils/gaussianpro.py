@@ -392,14 +392,15 @@ class GaussianProAnchorBuilder:
         min_consistent_views=2,
         adaptive_views=True,
         relaxed_min_views=2,
-        near_quantile=0.20,
-        far_quantile=0.80,
-        edge_radius=0.75,
+        near_quantile=0.10,
+        far_quantile=0.90,
+        edge_radius=0.90,
         max_photo_error=0.35,
         reprojection_threshold=2.0,
         depth_consistency_threshold=0.03,
         normal_consistency_threshold=0.5,
         depth_discrepancy_threshold=0.15,
+        edge_residual_priority=0.0,
         max_anchors_per_step=1024,
         min_proposals_per_step=1,
         use_plane_ncc=False,
@@ -439,6 +440,9 @@ class GaussianProAnchorBuilder:
         self.depth_discrepancy_threshold = float(
             depth_discrepancy_threshold
         )
+        self.edge_residual_priority = max(
+            0.0, float(edge_residual_priority)
+        )
         self.max_anchors_per_step = max(1, int(max_anchors_per_step))
         self.min_proposals_per_step = max(1, int(min_proposals_per_step))
         self.use_plane_ncc = bool(use_plane_ncc)
@@ -470,11 +474,13 @@ class GaussianProAnchorBuilder:
         height, width = depth.shape
         _, _, cx, cy = _intrinsics(camera, height, width)
         u, v = _pixel_grid(height, width, depth.device, depth.dtype)
-        radius = torch.sqrt(
-            ((u - cx) / max(0.5 * width, 1.0)).square()
-            + ((v - cy) / max(0.5 * height, 1.0)).square()
+        # Chebyshev image radius describes a true border band.  Euclidean
+        # radius marks too much of the diagonal interior as "edge".
+        image_radius = torch.maximum(
+            ((u - cx) / max(0.5 * width, 1.0)).abs(),
+            ((v - cy) / max(0.5 * height, 1.0)).abs(),
         )
-        difficult |= radius >= self.edge_radius
+        difficult |= image_radius >= self.edge_radius
         return torch.where(
             difficult,
             torch.full_like(required, self.relaxed_min_views),
@@ -1122,11 +1128,36 @@ class GaussianProAnchorBuilder:
         if accepted_indices.numel() < self.min_proposals_per_step:
             return result, None, None
 
+        # Residual is only a ranking signal after photometric and geometric
+        # consistency have accepted the proposal; it can never create
+        # single-view geometry by itself. Prioritize unresolved model regions
+        # that coincide with a real GT edge.
+        ref_gray = reference["image"].mean(dim=0)
+        ref_edge = torch.zeros_like(ref_gray)
+        ref_edge[:, 1:] += (
+            ref_gray[:, 1:] - ref_gray[:, :-1]
+        ).abs()
+        ref_edge[1:, :] += (
+            ref_gray[1:, :] - ref_gray[:-1, :]
+        ).abs()
+        positive_edge = ref_edge[ref_edge > 0]
+        edge_scale = (
+            torch.quantile(positive_edge, 0.90)
+            if positive_edge.numel()
+            else ref_edge.new_tensor(1.0)
+        ).clamp_min(1e-6)
+        edge_strength = (ref_edge / edge_scale).clamp(0.0, 1.0)
+        model_residual = torch.maximum(
+            relative_difference.clamp(0.0, 1.0),
+            (1.0 - reference["opacity"][0]).clamp(0.0, 1.0),
+        )
+        edge_residual = edge_strength * model_residual
         score = (
             consistent_views
             + (1.0 - best_cost.clamp(0.0, 1.0))
             + relative_difference.clamp(0.0, 2.0)
             + (1.0 - reference["opacity"][0])
+            + self.edge_residual_priority * edge_residual
         ).flatten()[accepted_indices]
         if accepted_indices.numel() > self.max_anchors_per_step:
             keep = torch.topk(
