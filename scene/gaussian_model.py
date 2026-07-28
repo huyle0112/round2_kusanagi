@@ -1201,6 +1201,7 @@ class GaussianModel:
         min_opacity=0.005,
         grow=True,
     ):
+        anchor_count_before_growth = int(self.get_anchor.shape[0])
         # # adding anchors
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
@@ -1209,6 +1210,53 @@ class GaussianModel:
         
         if grow:
             self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+            scaffold_added = (
+                int(self.get_anchor.shape[0]) - anchor_count_before_growth
+            )
+            if (
+                scaffold_added > 0
+                and self._gaussianpro_anchor_mask.numel()
+                == anchor_count_before_growth
+            ):
+                device = self.get_anchor.device
+                self._gaussianpro_anchor_mask = torch.cat(
+                    (
+                        self._gaussianpro_anchor_mask,
+                        torch.zeros(
+                            scaffold_added, dtype=torch.bool, device=device
+                        ),
+                    )
+                )
+                self._gaussianpro_confidence = torch.cat(
+                    (
+                        self._gaussianpro_confidence,
+                        torch.ones(
+                            scaffold_added,
+                            dtype=torch.float32,
+                            device=device,
+                        ),
+                    )
+                )
+                self._gaussianpro_observations = torch.cat(
+                    (
+                        self._gaussianpro_observations,
+                        torch.zeros(
+                            scaffold_added,
+                            dtype=torch.float32,
+                            device=device,
+                        ),
+                    )
+                )
+                self._gaussianpro_birth_iteration = torch.cat(
+                    (
+                        self._gaussianpro_birth_iteration,
+                        torch.zeros(
+                            scaffold_added,
+                            dtype=torch.long,
+                            device=device,
+                        ),
+                    )
+                )
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0

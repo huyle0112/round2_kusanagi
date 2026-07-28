@@ -84,6 +84,38 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 "gaussianpro_neighbors"
             )
         if not (
+            0.0 <= opt.gaussianpro_near_quantile
+            < opt.gaussianpro_far_quantile
+            <= 1.0
+        ):
+            raise ValueError(
+                "GaussianPro depth quantiles must satisfy "
+                "0 <= near < far <= 1"
+            )
+        if (
+            opt.gaussianpro_relaxed_min_views
+            > opt.gaussianpro_min_consistent_views
+        ):
+            raise ValueError(
+                "gaussianpro_relaxed_min_views cannot exceed "
+                "gaussianpro_min_consistent_views"
+            )
+        if (
+            opt.gaussianpro_relaxed_min_views < 1
+            or opt.gaussianpro_relaxed_min_views
+            > opt.gaussianpro_neighbors
+        ):
+            raise ValueError(
+                "gaussianpro_relaxed_min_views must be between 1 and "
+                "gaussianpro_neighbors"
+            )
+        if opt.gaussianpro_edge_radius <= 0:
+            raise ValueError("gaussianpro_edge_radius must be positive")
+        if opt.gaussianpro_scaffold_fallback_interval < 1:
+            raise ValueError(
+                "gaussianpro_scaffold_fallback_interval must be positive"
+            )
+        if not (
             opt.gaussianpro_start_iter
             < opt.gaussianpro_add_until_iter
             <= opt.gaussianpro_refine_until_iter
@@ -105,6 +137,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             opacity_threshold=opt.gaussianpro_opacity_threshold,
             coverage_threshold=opt.gaussianpro_coverage_threshold,
             min_consistent_views=opt.gaussianpro_min_consistent_views,
+            adaptive_views=opt.gaussianpro_adaptive_views,
+            relaxed_min_views=opt.gaussianpro_relaxed_min_views,
+            near_quantile=opt.gaussianpro_near_quantile,
+            far_quantile=opt.gaussianpro_far_quantile,
+            edge_radius=opt.gaussianpro_edge_radius,
             max_photo_error=opt.gaussianpro_max_photo_error,
             reprojection_threshold=opt.gaussianpro_reprojection_threshold,
             depth_consistency_threshold=(
@@ -138,6 +175,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             f"{opt.gaussianpro_refine_until_iter}, "
             f"interval {opt.gaussianpro_interval}, "
             f"downsample {opt.gaussianpro_downsample}, "
+            f"views {opt.gaussianpro_min_consistent_views}->"
+            f"{opt.gaussianpro_relaxed_min_views} at depth tails/edge, "
+            f"Scaffold fallback "
+            f"{opt.gaussianpro_scaffold_fallback_interval} iters, "
             f"anchor budget {gaussianpro_max_anchors}"
         )
         if logger:
@@ -297,26 +338,46 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gaussianpro_feature_l1 = None
         gaussianpro_feature_cos = None
         if gaussianpro_active:
-            # Penalize scale ratio, not raw scale, to avoid covariance collapse.
-            sorted_scaling = scaling.sort(dim=1).values
-            gaussianpro_flatness_ratio = (
-                sorted_scaling[:, 0] / sorted_scaling[:, 1].clamp_min(1e-8)
-            ).mean()
-            flatness_penalty = (
-                F.relu(
-                    gaussianpro_flatness_ratio
-                    - opt.gaussianpro_flatness_target
+            # Keep GP shape regularization off Scaffold fallback anchors.
+            gp_gaussian_mask = None
+            if (
+                gaussians._gaussianpro_anchor_mask.numel()
+                == gaussians.get_anchor.shape[0]
+            ):
+                visible_gp = gaussians._gaussianpro_anchor_mask[
+                    voxel_visible_mask
+                ]
+                visible_gp_offsets = visible_gp.unsqueeze(1).expand(
+                    -1, gaussians.n_offsets
+                ).reshape(-1)
+                gp_gaussian_mask = visible_gp_offsets[
+                    offset_selection_mask
+                ]
+            if gp_gaussian_mask is not None and gp_gaussian_mask.any():
+                # Penalize scale ratio, not raw scale, to avoid covariance
+                # collapse.
+                sorted_scaling = scaling[gp_gaussian_mask].sort(
+                    dim=1
+                ).values
+                gaussianpro_flatness_ratio = (
+                    sorted_scaling[:, 0]
+                    / sorted_scaling[:, 1].clamp_min(1e-8)
+                ).mean()
+                flatness_penalty = (
+                    F.relu(
+                        gaussianpro_flatness_ratio
+                        - opt.gaussianpro_flatness_target
+                    )
+                    + F.relu(
+                        opt.gaussianpro_flatness_floor
+                        - gaussianpro_flatness_ratio
+                    )
                 )
-                + F.relu(
-                    opt.gaussianpro_flatness_floor
-                    - gaussianpro_flatness_ratio
+                loss = (
+                    loss
+                    + opt.lambda_gaussianpro_flatness
+                    * flatness_penalty
                 )
-            )
-            loss = (
-                loss
-                + opt.lambda_gaussianpro_flatness
-                * flatness_penalty
-            )
             if iteration % max(1, opt.gaussianpro_feature_interval) == 0:
                 (
                     gaussianpro_feature_l1,
@@ -508,12 +569,33 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 
                 # densification
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
-                    if not opt.use_gaussianpro:
+                    scaffold_fallback_step = (
+                        opt.use_gaussianpro
+                        and opt.gaussianpro_scaffold_fallback
+                        and iteration
+                        % max(
+                            1,
+                            opt.gaussianpro_scaffold_fallback_interval,
+                        )
+                        == 0
+                    )
+                    if not opt.use_gaussianpro or scaffold_fallback_step:
                         gaussians.adjust_anchor(
-                            check_interval=opt.update_interval,
+                            check_interval=(
+                                opt.gaussianpro_scaffold_fallback_interval
+                                if opt.use_gaussianpro
+                                else opt.update_interval
+                            ),
                             success_threshold=opt.success_threshold,
                             grad_threshold=opt.densify_grad_threshold,
-                            min_opacity=opt.min_opacity,
+                            # GaussianPro owns pruning while hybrid training is
+                            # active, so fallback only grows image-driven
+                            # anchors and cannot bypass its grace period.
+                            min_opacity=(
+                                -1.0
+                                if opt.use_gaussianpro
+                                else opt.min_opacity
+                            ),
                         )
             cleanup_iteration = (
                 opt.gaussianpro_refine_until_iter

@@ -390,6 +390,11 @@ class GaussianProAnchorBuilder:
         opacity_threshold=0.5,
         coverage_threshold=0.7,
         min_consistent_views=2,
+        adaptive_views=True,
+        relaxed_min_views=2,
+        near_quantile=0.20,
+        far_quantile=0.80,
+        edge_radius=0.75,
         max_photo_error=0.35,
         reprojection_threshold=2.0,
         depth_consistency_threshold=0.03,
@@ -418,6 +423,13 @@ class GaussianProAnchorBuilder:
         self.opacity_threshold = float(opacity_threshold)
         self.coverage_threshold = float(coverage_threshold)
         self.min_consistent_views = max(1, int(min_consistent_views))
+        self.adaptive_views = bool(adaptive_views)
+        self.relaxed_min_views = max(
+            1, min(int(relaxed_min_views), self.min_consistent_views)
+        )
+        self.near_quantile = float(near_quantile)
+        self.far_quantile = float(far_quantile)
+        self.edge_radius = float(edge_radius)
         self.max_photo_error = float(max_photo_error)
         self.reprojection_threshold = float(reprojection_threshold)
         self.depth_consistency_threshold = float(depth_consistency_threshold)
@@ -438,6 +450,36 @@ class GaussianProAnchorBuilder:
         order_rng.shuffle(self.reference_order)
         self.reference_cursor = 0
         self.last_point_confidence = None
+
+    def _required_views(self, depth, camera):
+        """Per-pixel source-view requirement for depth and image extremes."""
+        required = torch.full_like(
+            depth, self.min_consistent_views, dtype=torch.long
+        )
+        if not self.adaptive_views:
+            return required
+
+        valid = torch.isfinite(depth) & (depth > 0)
+        difficult = torch.zeros_like(valid)
+        valid_depth = depth[valid]
+        if valid_depth.numel() >= 2:
+            near = torch.quantile(valid_depth, self.near_quantile)
+            far = torch.quantile(valid_depth, self.far_quantile)
+            difficult |= valid & ((depth <= near) | (depth >= far))
+
+        height, width = depth.shape
+        _, _, cx, cy = _intrinsics(camera, height, width)
+        u, v = _pixel_grid(height, width, depth.device, depth.dtype)
+        radius = torch.sqrt(
+            ((u - cx) / max(0.5 * width, 1.0)).square()
+            + ((v - cy) / max(0.5 * height, 1.0)).square()
+        )
+        difficult |= radius >= self.edge_radius
+        return torch.where(
+            difficult,
+            torch.full_like(required, self.relaxed_min_views),
+            required,
+        )
 
     def next_reference(self):
         camera = self.reference_order[
@@ -567,8 +609,11 @@ class GaussianProAnchorBuilder:
             view_count += valid.to(view_count.dtype)
 
         cost = cost_sum / view_count.clamp_min(1.0)
+        required_views = self._required_views(
+            candidate_depth, reference["camera"]
+        )
         cost = torch.where(
-            view_count >= self.min_consistent_views,
+            view_count >= required_views,
             cost,
             torch.full_like(cost, _INF),
         )
@@ -696,8 +741,11 @@ class GaussianProAnchorBuilder:
             view_count += valid_view.to(view_count.dtype)
 
         cost = total_cost / view_count.clamp_min(1.0)
+        required_views = self._required_views(
+            candidate_depth, reference["camera"]
+        )
         cost = torch.where(
-            view_count >= self.min_consistent_views,
+            view_count >= required_views,
             cost,
             torch.full_like(cost, _INF),
         )
@@ -913,7 +961,12 @@ class GaussianProAnchorBuilder:
         self.last_point_confidence = None
         self._ray_cache.clear()
         neighbor_cameras = self.graph.get(reference_camera.image_name, [])
-        if len(neighbor_cameras) < self.min_consistent_views:
+        minimum_required = (
+            self.relaxed_min_views
+            if self.adaptive_views
+            else self.min_consistent_views
+        )
+        if len(neighbor_cameras) < minimum_required:
             return result, None, None
 
         rendered_views = {}
@@ -946,7 +999,7 @@ class GaussianProAnchorBuilder:
                     if camera.image_name
                     != source["camera"].image_name
                 ]
-                if len(support_views) < self.min_consistent_views:
+                if len(support_views) < minimum_required:
                     continue
                 for support in support_views:
                     self._apply_cached_geometry(support)
@@ -960,10 +1013,9 @@ class GaussianProAnchorBuilder:
                 source_valid = (
                     torch.isfinite(source_cost)
                     & (source_cost <= self.max_photo_error)
-                    & (
-                        source_views
-                        >= self.min_consistent_views
-                    )
+                    & (source_views >= self._required_views(
+                        source_depth, source["camera"]
+                    ))
                     & (source_depth > 0)
                 )
                 source_consistent_views = self._geometric_consistency(
@@ -971,7 +1023,9 @@ class GaussianProAnchorBuilder:
                 )
                 source_valid &= (
                     source_consistent_views
-                    >= self.min_consistent_views
+                    >= self._required_views(
+                        source_depth, source["camera"]
+                    )
                 )
                 source_normal_world, source_normal_valid = (
                     _depth_to_world_normal(
@@ -1009,17 +1063,20 @@ class GaussianProAnchorBuilder:
             .item()
         )
 
+        required_views = self._required_views(
+            best_depth, reference_camera
+        )
         photo_mask = (
             torch.isfinite(best_cost)
             & (best_cost <= self.max_photo_error)
-            & (best_views >= self.min_consistent_views)
+            & (best_views >= required_views)
             & (best_depth > 0)
         )
         result.photometric_count = int(photo_mask.sum().item())
         consistent_views = self._geometric_consistency(
             best_depth, reference, sources
         )
-        geometry_mask = consistent_views >= self.min_consistent_views
+        geometry_mask = consistent_views >= required_views
         result.consistent_count = int((photo_mask & geometry_mask).sum().item())
         propagated_normal_world, normal_valid = _depth_to_world_normal(
             best_depth, reference_camera

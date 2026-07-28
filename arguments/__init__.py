@@ -184,6 +184,13 @@ class OptimizationParams(ParamGroup):
         self.gaussianpro_opacity_threshold = 0.5
         self.gaussianpro_coverage_threshold = 0.5
         self.gaussianpro_min_consistent_views = 3
+        # Relax multi-view support only for geometrically difficult pixels:
+        # the nearest/farthest depth quantiles and the image periphery.
+        self.gaussianpro_adaptive_views = True
+        self.gaussianpro_relaxed_min_views = 2
+        self.gaussianpro_near_quantile = 0.20
+        self.gaussianpro_far_quantile = 0.80
+        self.gaussianpro_edge_radius = 0.75
         self.gaussianpro_max_photo_error = 0.25
         self.gaussianpro_reprojection_threshold = 2.0
         self.gaussianpro_depth_consistency_threshold = 0.03
@@ -200,6 +207,10 @@ class OptimizationParams(ParamGroup):
         self.gaussianpro_prune_confidence = 0.25
         self.gaussianpro_prune_opacity = 0.01
         self.gaussianpro_prune_grace_iters = 1000
+        # Image-gradient growth remains available as a single-view fallback
+        # where GaussianPro cannot obtain relaxed_min_views source cameras.
+        self.gaussianpro_scaffold_fallback = True
+        self.gaussianpro_scaffold_fallback_interval = 200
 
         # Geometry supervision stops at refine_until. Flatness is a hinge
         # target, so ratios below the target are not pushed towards zero.
