@@ -288,6 +288,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
                 "selection_mask": mask,
                 "neural_opacity": neural_opacity,
                 "scaling": scaling,
+                "rotation": rot,
                 }
         result.update(geometry_outputs)
         return result

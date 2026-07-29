@@ -10,6 +10,7 @@
 #
 
 import torch
+import torch.nn.functional as F
 from functools import reduce
 import math
 import numpy as np
@@ -29,6 +30,22 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
+
+
+def _quaternion_from_z_axis(normals):
+    """Return wxyz quaternions rotating local +Z onto world-space normals."""
+    normals = torch.nn.functional.normalize(normals, dim=-1, eps=1e-6)
+    z = torch.zeros_like(normals)
+    z[:, 2] = 1.0
+    dot = (z * normals).sum(dim=-1)
+    cross = torch.cross(z, normals, dim=-1)
+    quaternion = torch.cat(((1.0 + dot).unsqueeze(-1), cross), dim=-1)
+    opposite = dot < (-1.0 + 1e-5)
+    if opposite.any():
+        quaternion[opposite] = quaternion.new_tensor(
+            [0.0, 1.0, 0.0, 0.0]
+        )
+    return torch.nn.functional.normalize(quaternion, dim=-1, eps=1e-6)
 
     
 class GaussianModel:
@@ -750,6 +767,7 @@ class GaussianModel:
     def add_propagated_anchors(
         self,
         world_points,
+        world_normals=None,
         voxel_size=None,
         nearest_feature_chunk=64,
         confidence=None,
@@ -773,6 +791,15 @@ class GaussianModel:
             raise ValueError("Propagation voxel size must be positive")
 
         finite = torch.isfinite(world_points).all(dim=-1)
+        if world_normals is not None:
+            finite &= (
+                torch.isfinite(world_normals).all(dim=-1)
+                & (world_normals.norm(dim=-1) > 0.5)
+            )
+            world_normals = world_normals[finite].to(
+                device=self.get_anchor.device,
+                dtype=self.get_anchor.dtype,
+            )
         world_points = world_points[finite].to(
             device=self.get_anchor.device,
             dtype=self.get_anchor.dtype,
@@ -780,8 +807,19 @@ class GaussianModel:
         if world_points.numel() == 0:
             return 0
 
-        candidate_grid = torch.round(world_points / cell_size).to(torch.int64)
-        candidate_grid = torch.unique(candidate_grid, dim=0)
+        raw_grid = torch.round(world_points / cell_size).to(torch.int64)
+        candidate_grid, raw_inverse = torch.unique(
+            raw_grid, dim=0, return_inverse=True
+        )
+        candidate_normals = None
+        if world_normals is not None:
+            normal_sum = torch.zeros(
+                (candidate_grid.shape[0], 3),
+                device=world_normals.device,
+                dtype=world_normals.dtype,
+            )
+            normal_sum.index_add_(0, raw_inverse, world_normals)
+            candidate_normals = F.normalize(normal_sum, dim=-1, eps=1e-6)
         existing_grid = torch.round(
             self.get_anchor.detach() / cell_size
         ).to(torch.int64)
@@ -800,6 +838,8 @@ class GaussianModel:
         occupied[existing_inverse] = True
         is_new = ~occupied[candidate_inverse]
         candidate_grid = candidate_grid[is_new]
+        if candidate_normals is not None:
+            candidate_normals = candidate_normals[is_new]
         if candidate_grid.shape[0] == 0:
             return 0
 
@@ -849,7 +889,10 @@ class GaussianModel:
         new_scaling = torch.log(
             local_scale.unsqueeze(1).repeat(1, 6)
         )
-        new_rotation = self._rotation.detach()[nearest_indices].clone()
+        if candidate_normals is not None:
+            new_rotation = _quaternion_from_z_axis(candidate_normals)
+        else:
+            new_rotation = self._rotation.detach()[nearest_indices].clone()
         new_opacity = inverse_sigmoid(
             torch.full(
                 (new_anchor.shape[0], 1),
@@ -1008,6 +1051,7 @@ class GaussianModel:
     def manage_gaussianpro_anchors(
         self,
         world_points,
+        world_normals,
         confidence,
         *,
         iteration,
@@ -1038,6 +1082,18 @@ class GaussianModel:
                 device=self.get_anchor.device,
                 dtype=self.get_anchor.dtype,
             )
+            normals = None
+            if (
+                world_normals is not None
+                and world_normals.shape == world_points.shape
+            ):
+                normals = F.normalize(
+                    world_normals.to(
+                        device=points.device, dtype=points.dtype
+                    ),
+                    dim=-1,
+                    eps=1e-6,
+                )
             if confidence is None or confidence.numel() != points.shape[0]:
                 point_confidence = torch.full(
                     (points.shape[0],),
@@ -1082,6 +1138,9 @@ class GaussianModel:
             if refine_mask.any():
                 indices = nearest_indices[refine_mask]
                 samples = points[refine_mask]
+                sample_normals = (
+                    normals[refine_mask] if normals is not None else None
+                )
                 weights = point_confidence[refine_mask].clamp(0.05, 1.0)
                 position_sum = torch.zeros_like(self.get_anchor)
                 weight_sum = torch.zeros(
@@ -1100,6 +1159,19 @@ class GaussianModel:
                     * weight_sum[touched].clamp(max=1.0)
                 ).unsqueeze(1)
                 self._anchor.data[touched].lerp_(target, update_rate)
+                if sample_normals is not None:
+                    normal_sum = torch.zeros_like(self.get_anchor)
+                    normal_sum.index_add_(
+                        0,
+                        indices,
+                        sample_normals * weights.unsqueeze(1),
+                    )
+                    target_normals = F.normalize(
+                        normal_sum[touched], dim=-1, eps=1e-6
+                    )
+                    self._rotation.data[touched] = _quaternion_from_z_axis(
+                        target_normals
+                    )
 
                 confidence_sum = torch.zeros_like(
                     self._gaussianpro_confidence
@@ -1134,6 +1206,11 @@ class GaussianModel:
                 ).squeeze(1)[:remaining_budget]
                 added_count = self.add_propagated_anchors(
                     points[add_indices],
+                    (
+                        normals[add_indices]
+                        if normals is not None
+                        else None
+                    ),
                     voxel_size=voxel_size,
                     confidence=point_confidence[add_indices],
                     birth_iteration=iteration,

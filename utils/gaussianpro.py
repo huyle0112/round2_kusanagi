@@ -6,9 +6,9 @@ and processes each reference only once:
 
 * choose source views from a pose/frustum-overlap graph;
 * render low-resolution depth maps for the reference and source views;
-* propagate source depth hypotheses into the reference view;
-* refine them with PatchMatch-style spatial propagation and deterministic
-  depth search using multi-view patch descriptors;
+* propagate joint source depth-normal plane hypotheses into the reference;
+* refine them with red/black PatchMatch-style spatial propagation and
+  deterministic depth search using plane-induced multi-view NCC;
 * retain only hypotheses that pass multi-view depth/reprojection checks.
 
 The accepted world-space points are inserted into Scaffold-GS by
@@ -226,11 +226,25 @@ def _world_ray_grid(camera, height, width, offset_y=0, offset_x=0):
     return camera_points @ rotation
 
 
-def _plane_propagation_candidates(depth, camera, step):
-    """Propagate neighbouring slanted planes into each target pixel."""
+def _camera_normal_to_world(normal_camera, camera):
+    """Transform CHW camera-space normals to normalized world-space normals."""
+    rotation = torch.linalg.inv(camera.world_view_transform[:3, :3]).to(
+        device=normal_camera.device, dtype=normal_camera.dtype
+    )
+    return F.normalize(
+        normal_camera.permute(1, 2, 0) @ rotation,
+        dim=-1,
+        eps=1e-6,
+    ).permute(2, 0, 1)
+
+
+def _plane_propagation_candidates(depth, normal_world, camera, step):
+    """Propagate joint neighbouring depth-normal plane hypotheses."""
     points = backproject_depth(depth, camera)
-    normals, normal_valid = _depth_to_world_normal(depth, camera)
-    normals = normals.permute(1, 2, 0)
+    normals = normal_world.permute(1, 2, 0)
+    normal_valid = torch.isfinite(normals).all(dim=-1) & (
+        normals.norm(dim=-1) > 0.5
+    )
     height, width = depth.shape
     unit_depth = torch.ones_like(depth)
     ray_point = backproject_depth(unit_depth, camera)
@@ -267,9 +281,68 @@ def _plane_propagation_candidates(depth, camera, step):
             & torch.isfinite(candidate_depth)
             & (candidate_depth > 0)
         )
+        candidate_depth = torch.where(
+            valid, candidate_depth, torch.zeros_like(candidate_depth)
+        )
+        candidate_normal = torch.where(
+            valid.unsqueeze(-1),
+            F.normalize(plane_normal, dim=-1, eps=1e-6),
+            torch.zeros_like(plane_normal),
+        ).permute(2, 0, 1)
+        candidates.append((candidate_depth, candidate_normal))
+    return candidates
+
+
+def _random_plane_candidates(
+    depth,
+    normal_world,
+    depth_radius,
+    normal_radius,
+    count=2,
+):
+    """Randomly refine joint plane hypotheses in depth-normal space."""
+    valid = (
+        torch.isfinite(depth)
+        & (depth > 0)
+        & torch.isfinite(normal_world).all(dim=0)
+        & (normal_world.norm(dim=0) > 0.5)
+    )
+    base_normal = F.normalize(normal_world, dim=0, eps=1e-6)
+    candidates = []
+    for _ in range(max(0, int(count))):
+        depth_noise = (
+            2.0 * torch.rand_like(depth) - 1.0
+        ) * float(depth_radius)
+        candidate_depth = depth * (1.0 + depth_noise)
+
+        noise = torch.randn_like(base_normal)
+        # Restrict normal perturbations to the tangent plane so their angular
+        # radius is controlled and normalization does not bias toward zero.
+        tangent = noise - (
+            noise * base_normal
+        ).sum(dim=0, keepdim=True) * base_normal
+        tangent = F.normalize(tangent, dim=0, eps=1e-6)
+        angle = (
+            2.0 * torch.rand_like(depth) - 1.0
+        ) * float(normal_radius)
+        candidate_normal = F.normalize(
+            torch.cos(angle).unsqueeze(0) * base_normal
+            + torch.sin(angle).unsqueeze(0) * tangent,
+            dim=0,
+            eps=1e-6,
+        )
         candidates.append(
-            torch.where(
-                valid, candidate_depth, torch.zeros_like(candidate_depth)
+            (
+                torch.where(
+                    valid,
+                    candidate_depth,
+                    torch.zeros_like(candidate_depth),
+                ),
+                torch.where(
+                    valid.unsqueeze(0),
+                    candidate_normal,
+                    torch.zeros_like(candidate_normal),
+                ),
             )
         )
     return candidates
@@ -563,30 +636,40 @@ class GaussianProAnchorBuilder:
             "descriptor": _patch_descriptor(image, self.patch_radius),
         }
 
-    def _splat_source_depth(self, source, reference):
+    def _splat_source_plane(self, source, reference):
+        """Z-buffer a source view's joint depth-normal hypotheses."""
         source_depth = source["depth"][0]
         source_valid = (
             torch.isfinite(source_depth)
             & (source_depth > 0)
             & (source["opacity"][0] >= self.opacity_threshold)
         )
-        source_world = backproject_depth(
-            source_depth, source["camera"]
-        )[source_valid]
+        source_world_map = backproject_depth(source_depth, source["camera"])
+        source_normal_world_map = _camera_normal_to_world(
+            source["normal"], source["camera"]
+        ).permute(1, 2, 0)
+        source_world = source_world_map[source_valid]
+        source_normals = source_normal_world_map[source_valid]
         ref_height, ref_width = reference["depth"].shape[-2:]
         u, v, z = project_world(
             source_world, reference["camera"], ref_height, ref_width
         )
         inside = _inside(u, v, z, ref_height, ref_width)
         if not inside.any():
-            return torch.zeros(
+            empty_depth = torch.zeros(
                 (ref_height, ref_width),
+                device=source_depth.device,
+                dtype=source_depth.dtype,
+            )
+            return empty_depth, torch.zeros(
+                (3, ref_height, ref_width),
                 device=source_depth.device,
                 dtype=source_depth.dtype,
             )
         u = u[inside].round().long()
         v = v[inside].round().long()
         z = z[inside]
+        source_normals = source_normals[inside]
         flat_index = v * ref_width + u
         splatted = torch.full(
             (ref_height * ref_width,),
@@ -597,16 +680,58 @@ class GaussianProAnchorBuilder:
         splatted.scatter_reduce_(
             0, flat_index, z, reduce="amin", include_self=True
         )
-        return torch.where(
+        splatted_depth = torch.where(
             splatted < _INF,
             splatted,
             torch.zeros_like(splatted),
         ).reshape(ref_height, ref_width)
+        # Average normals only from samples that survived the nearest-depth
+        # z-buffer. This preserves the plane paired with each depth candidate.
+        nearest = splatted[flat_index]
+        winner = (z - nearest).abs() <= (
+            1e-5 * nearest.abs().clamp_min(1.0)
+        )
+        normal_sum = torch.zeros(
+            (ref_height * ref_width, 3),
+            device=z.device,
+            dtype=z.dtype,
+        )
+        normal_count = torch.zeros(
+            (ref_height * ref_width, 1),
+            device=z.device,
+            dtype=z.dtype,
+        )
+        normal_sum.index_add_(0, flat_index[winner], source_normals[winner])
+        normal_count.index_add_(
+            0,
+            flat_index[winner],
+            torch.ones(
+                (int(winner.sum().item()), 1),
+                device=z.device,
+                dtype=z.dtype,
+            ),
+        )
+        splatted_normal = F.normalize(
+            normal_sum / normal_count.clamp_min(1.0),
+            dim=-1,
+            eps=1e-6,
+        )
+        splatted_normal = torch.where(
+            normal_count > 0,
+            splatted_normal,
+            torch.zeros_like(splatted_normal),
+        )
+        return (
+            splatted_depth,
+            splatted_normal.reshape(ref_height, ref_width, 3).permute(2, 0, 1),
+        )
 
-    def _photometric_cost(self, candidate_depth, reference, sources):
+    def _photometric_cost(
+        self, candidate_depth, candidate_normal, reference, sources
+    ):
         if self.use_plane_ncc:
             return self._photometric_cost_plane_ncc(
-                candidate_depth, reference, sources
+                candidate_depth, candidate_normal, reference, sources
             )
 
         ref_height, ref_width = candidate_depth.shape
@@ -666,16 +791,19 @@ class GaussianProAnchorBuilder:
         return self._ray_cache[key]
 
     def _photometric_cost_plane_ncc(
-        self, candidate_depth, reference, sources
+        self, candidate_depth, candidate_normal, reference, sources
     ):
         """Plane-induced multi-view warp scored with normalized correlation."""
         height, width = candidate_depth.shape
         camera = reference["camera"]
         plane_point = backproject_depth(candidate_depth, camera)
-        plane_normal, normal_valid = _depth_to_world_normal(
-            candidate_depth, camera
+        plane_normal = F.normalize(
+            candidate_normal.permute(1, 2, 0), dim=-1, eps=1e-6
         )
-        plane_normal = plane_normal.permute(1, 2, 0)
+        normal_valid = (
+            torch.isfinite(plane_normal).all(dim=-1)
+            & (plane_normal.norm(dim=-1) > 0.5)
+        )
         centre = camera.camera_center.to(
             device=candidate_depth.device, dtype=candidate_depth.dtype
         )
@@ -783,58 +911,119 @@ class GaussianProAnchorBuilder:
         )
         return cost, view_count
 
-    def _select_best(self, depth_candidates, reference, sources):
+    def _select_best(self, candidates, reference, sources):
         costs = []
         counts = []
-        for candidate in depth_candidates:
+        for candidate_depth, candidate_normal in candidates:
             cost, count = self._photometric_cost(
-                candidate, reference, sources
+                candidate_depth, candidate_normal, reference, sources
             )
             costs.append(cost)
             counts.append(count)
         cost_stack = torch.stack(costs)
         best_cost, best_index = cost_stack.min(dim=0)
-        depth_stack = torch.stack(depth_candidates)
+        depth_stack = torch.stack([candidate[0] for candidate in candidates])
         best_depth = torch.gather(
             depth_stack, 0, best_index.unsqueeze(0)
         ).squeeze(0)
+        normal_stack = torch.stack([candidate[1] for candidate in candidates])
+        best_normal = torch.gather(
+            normal_stack,
+            0,
+            best_index[None, None].expand(
+                1, normal_stack.shape[1], -1, -1
+            ),
+        ).squeeze(0)
+        best_normal = F.normalize(best_normal, dim=0, eps=1e-6)
         count_stack = torch.stack(counts)
         best_count = torch.gather(
             count_stack, 0, best_index.unsqueeze(0)
         ).squeeze(0)
-        return best_depth, best_cost, best_count
+        return best_depth, best_normal, best_cost, best_count
 
     def _solve_view(self, reference, sources):
         reference_depth = reference["depth"][0]
+        reference_normal = _camera_normal_to_world(
+            reference["normal"], reference["camera"]
+        )
+        reference_valid = (
+            reference["opacity"][0] >= self.opacity_threshold
+        )
         candidates = [
-            torch.where(
-                reference["opacity"][0] >= self.opacity_threshold,
-                reference_depth,
-                torch.zeros_like(reference_depth),
+            (
+                torch.where(
+                    reference_valid,
+                    reference_depth,
+                    torch.zeros_like(reference_depth),
+                ),
+                torch.where(
+                    reference_valid.unsqueeze(0),
+                    reference_normal,
+                    torch.zeros_like(reference_normal),
+                ),
             )
         ]
         candidates.extend(
-            self._splat_source_depth(source, reference)
+            self._splat_source_plane(source, reference)
             for source in sources
         )
-        best_depth, best_cost, best_views = self._select_best(
+        best_depth, best_normal, best_cost, best_views = self._select_best(
             candidates, reference, sources
         )
         for patchmatch_iteration in range(self.patchmatch_iterations):
             step = min(2 ** patchmatch_iteration, 8)
             search = 0.08 / (patchmatch_iteration + 1)
-            refinements = [
-                best_depth,
-                *_plane_propagation_candidates(
-                    best_depth, reference["camera"], step
-                ),
-                best_depth * (1.0 - search),
-                best_depth * (1.0 + search),
-            ]
-            best_depth, best_cost, best_views = self._select_best(
-                refinements, reference, sources
+            normal_search = math.radians(
+                15.0 / (patchmatch_iteration + 1)
             )
-        return best_depth, best_cost, best_views, candidates
+            height, width = best_depth.shape
+            u, v = _pixel_grid(
+                height,
+                width,
+                best_depth.device,
+                best_depth.dtype,
+            )
+            # ACMH-style red/black updates allow newly selected planes from
+            # one half-pass to participate in the next half-pass.
+            for parity in (0, 1):
+                refinements = [
+                    (best_depth, best_normal),
+                    *_plane_propagation_candidates(
+                        best_depth,
+                        best_normal,
+                        reference["camera"],
+                        step,
+                    ),
+                    *_random_plane_candidates(
+                        best_depth,
+                        best_normal,
+                        search,
+                        normal_search,
+                        count=2,
+                    ),
+                ]
+                (
+                    selected_depth,
+                    selected_normal,
+                    selected_cost,
+                    selected_views,
+                ) = self._select_best(refinements, reference, sources)
+                active = ((u.long() + v.long()) & 1) == parity
+                best_depth = torch.where(
+                    active, selected_depth, best_depth
+                )
+                best_normal = torch.where(
+                    active.unsqueeze(0), selected_normal, best_normal
+                )
+                best_cost = torch.where(active, selected_cost, best_cost)
+                best_views = torch.where(active, selected_views, best_views)
+        return (
+            best_depth,
+            best_normal,
+            best_cost,
+            best_views,
+            candidates,
+        )
 
     def _cache_view_geometry(
         self,
@@ -883,15 +1072,26 @@ class GaussianProAnchorBuilder:
             normal_camera, dim=-1, eps=1e-6
         ).permute(2, 0, 1)
 
-    def _geometric_consistency(self, depth, reference, sources):
+    def _geometric_consistency(
+        self, depth, reference, sources, normal_world=None
+    ):
         ref_height, ref_width = depth.shape
         ref_u, ref_v = _pixel_grid(
             ref_height, ref_width, depth.device, depth.dtype
         )
         world = backproject_depth(depth, reference["camera"])
-        reference_normal, reference_normal_valid = _depth_to_world_normal(
-            depth, reference["camera"]
-        )
+        if normal_world is None:
+            reference_normal, reference_normal_valid = _depth_to_world_normal(
+                depth, reference["camera"]
+            )
+        else:
+            reference_normal = F.normalize(
+                normal_world, dim=0, eps=1e-6
+            )
+            reference_normal_valid = (
+                torch.isfinite(reference_normal).all(dim=0)
+                & (reference_normal.norm(dim=0) > 0.5)
+            )
         reference_normal = reference_normal.permute(1, 2, 0)
         consistent = torch.zeros_like(depth)
 
@@ -1047,6 +1247,7 @@ class GaussianProAnchorBuilder:
                 self._ray_cache.clear()
                 (
                     source_depth,
+                    source_normal_world,
                     source_cost,
                     source_views,
                     _,
@@ -1060,7 +1261,10 @@ class GaussianProAnchorBuilder:
                     & (source_depth > 0)
                 )
                 source_consistent_views = self._geometric_consistency(
-                    source_depth, source, support_views
+                    source_depth,
+                    source,
+                    support_views,
+                    source_normal_world,
                 )
                 source_valid &= (
                     source_consistent_views
@@ -1068,10 +1272,9 @@ class GaussianProAnchorBuilder:
                         source_depth, source["camera"]
                     )
                 )
-                source_normal_world, source_normal_valid = (
-                    _depth_to_world_normal(
-                        source_depth, source["camera"]
-                    )
+                source_normal_valid = (
+                    torch.isfinite(source_normal_world).all(dim=0)
+                    & (source_normal_world.norm(dim=0) > 0.5)
                 )
                 source_valid &= source_normal_valid
                 source_normal_camera = (
@@ -1091,6 +1294,7 @@ class GaussianProAnchorBuilder:
         self._ray_cache.clear()
         (
             best_depth,
+            best_normal_world,
             best_cost,
             best_views,
             candidates,
@@ -1098,7 +1302,7 @@ class GaussianProAnchorBuilder:
 
         reference_depth = reference["depth"][0]
         result.candidate_count = int(
-            torch.stack([candidate > 0 for candidate in candidates])
+            torch.stack([candidate[0] > 0 for candidate in candidates])
             .any(dim=0)
             .sum()
             .item()
@@ -1115,12 +1319,16 @@ class GaussianProAnchorBuilder:
         )
         result.photometric_count = int(photo_mask.sum().item())
         consistent_views = self._geometric_consistency(
-            best_depth, reference, sources
+            best_depth, reference, sources, best_normal_world
         )
         geometry_mask = consistent_views >= required_views
         result.consistent_count = int((photo_mask & geometry_mask).sum().item())
-        propagated_normal_world, normal_valid = _depth_to_world_normal(
-            best_depth, reference_camera
+        propagated_normal_world = F.normalize(
+            best_normal_world, dim=0, eps=1e-6
+        )
+        normal_valid = (
+            torch.isfinite(propagated_normal_world).all(dim=0)
+            & (propagated_normal_world.norm(dim=0) > 0.5)
         )
         propagated_normal_camera = self._normal_world_to_camera(
             propagated_normal_world, reference_camera
@@ -1138,7 +1346,7 @@ class GaussianProAnchorBuilder:
         relative_difference = torch.where(
             current_valid,
             (best_depth - reference_depth).abs()
-            / best_depth.clamp_min(1e-6),
+            / reference_depth.abs().clamp_min(1e-6),
             torch.full_like(best_depth, _INF),
         )
         under_covered = (
@@ -1218,6 +1426,19 @@ class GaussianProAnchorBuilder:
             propagated_normal_world.permute(1, 2, 0)
             .reshape(-1, 3)[accepted_indices]
         )
+        # Plane normals are sign-ambiguous. Canonicalize them toward the
+        # reference camera before cross-view voxel aggregation so equivalent
+        # hypotheses do not cancel each other.
+        toward_camera = (
+            reference_camera.camera_center.to(
+                device=points.device, dtype=points.dtype
+            ).unsqueeze(0)
+            - points
+        )
+        flip = (point_normals * toward_camera).sum(dim=-1) < 0
+        point_normals = torch.where(
+            flip.unsqueeze(-1), -point_normals, point_normals
+        )
         result.proposed_count = int(points.shape[0])
         if points.numel():
             result.mean_photo_error = float(
@@ -1237,3 +1458,73 @@ class GaussianProAnchorBuilder:
                 0.6 * view_confidence + 0.4 * photo_confidence
             ).clamp(0.0, 1.0)
         return result, points, point_normals
+
+    @torch.no_grad()
+    def run_batch(
+        self,
+        reference_count,
+        gaussians,
+        pipe,
+        background,
+        render_fn,
+        prefilter_fn,
+        require_new_anchor=True,
+    ):
+        """Propagate several references and concatenate their evidence."""
+        results = []
+        point_batches = []
+        normal_batches = []
+        confidence_batches = []
+        for _ in range(max(1, int(reference_count))):
+            reference = self.next_reference()
+            result, points, normals = self.run(
+                reference,
+                gaussians,
+                pipe,
+                background,
+                render_fn,
+                prefilter_fn,
+                require_new_anchor=require_new_anchor,
+            )
+            results.append(result)
+            if points is not None and points.numel():
+                point_batches.append(points)
+                normal_batches.append(normals)
+                confidence_batches.append(self.last_point_confidence)
+
+        aggregate = PropagationResult(
+            reference_name=",".join(
+                result.reference_name for result in results
+            )
+        )
+        for field in (
+            "candidate_count",
+            "photometric_count",
+            "consistent_count",
+            "proposed_count",
+        ):
+            setattr(
+                aggregate,
+                field,
+                sum(getattr(result, field) for result in results),
+            )
+        weighted_count = sum(result.proposed_count for result in results)
+        if weighted_count:
+            aggregate.mean_photo_error = sum(
+                result.mean_photo_error * result.proposed_count
+                for result in results
+            ) / weighted_count
+            aggregate.mean_consistent_views = sum(
+                result.mean_consistent_views * result.proposed_count
+                for result in results
+            ) / weighted_count
+
+        if not point_batches:
+            self.last_point_confidence = None
+            return aggregate, None, None
+        self.last_point_confidence = torch.cat(confidence_batches)
+        return (
+            aggregate,
+            torch.cat(point_batches),
+            torch.cat(normal_batches),
+        )

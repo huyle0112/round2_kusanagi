@@ -10,15 +10,6 @@
 #
 
 import os
-import numpy as np
-
-import subprocess
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
-
-os.system('echo $CUDA_VISIBLE_DEVICES')
-
 
 import torch
 import torch.nn.functional as F
@@ -40,7 +31,7 @@ from utils.gaussianpro import GaussianProAnchorBuilder
 from gaussian_renderer import prefilter_voxel, render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
+from utils.general_utils import build_rotation, safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -208,6 +199,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
+    # GaussianPro owns anchor growth/pruning only through its refinement
+    # window.  Its densification accumulators must be collected and freed
+    # against the same cutoff; otherwise they are deleted at refine_until
+    # and training_statis() accesses them again on the following iteration.
+    statistics_until_iteration = (
+        min(opt.update_until, opt.gaussianpro_refine_until_iter)
+        if gaussianpro is not None
+        else opt.update_until
+    )
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
@@ -246,10 +246,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             gaussianpro_allow_add = (
                 iteration < opt.gaussianpro_add_until_iter
             )
-            if (
-                opt.gaussianpro_paper_faithful
-                or opt.gaussianpro_neighbor_mode == "temporal"
-            ):
+            if opt.gaussianpro_paper_faithful:
+                # The paper reports a fixed absolute-relative depth
+                # discrepancy threshold sigma=0.8.
+                gaussianpro.depth_discrepancy_threshold = 0.8
+            elif opt.gaussianpro_neighbor_mode == "temporal":
                 propagation_progress = (
                     (iteration - opt.gaussianpro_start_iter)
                     / max(
@@ -269,10 +270,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         - opt.gaussianpro_depth_discrepancy_start
                     )
                 )
-            reference_camera = gaussianpro.next_reference()
-            gaussianpro_result, proposed_points, _proposed_normals = (
-                gaussianpro.run(
-                    reference_camera,
+            gaussianpro_result, proposed_points, proposed_normals = (
+                gaussianpro.run_batch(
+                    opt.gaussianpro_references_per_step,
                     gaussians,
                     pipe,
                     background,
@@ -283,6 +283,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             )
             gaussianpro_lifecycle = gaussians.manage_gaussianpro_anchors(
                 proposed_points,
+                proposed_normals,
                 gaussianpro.last_point_confidence,
                 iteration=iteration,
                 allow_add=gaussianpro_allow_add,
@@ -349,7 +350,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gaussianpro_active = (
             gaussianpro is not None
             and iteration >= opt.gaussianpro_start_iter
-            and iteration < opt.gaussianpro_refine_until_iter
         )
         gaussianpro_plane_step = (
             gaussianpro_active
@@ -357,7 +357,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         )
 
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
-        retain_grad = (iteration < opt.update_until and iteration >= 0)
+        retain_grad = (
+            iteration < statistics_until_iteration and iteration >= 0
+        )
         render_pkg = render(
             viewpoint_cam,
             gaussians,
@@ -370,6 +372,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         )
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
+        generated_rotation = render_pkg["rotation"]
 
         gt_image = viewpoint_cam.original_image.cuda()
 
@@ -413,7 +416,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gaussianpro_feature_l1 = None
         gaussianpro_feature_cos = None
         if gaussianpro_active:
-            # Keep GP shape regularization off Scaffold fallback anchors.
+            # Paper-faithful mode applies the scale constraint to the whole
+            # representation. The adapted mode limits it to propagated
+            # anchors so Scaffold fallback geometry is unaffected.
             gp_gaussian_mask = None
             if (
                 gaussians._gaussianpro_anchor_mask.numel()
@@ -428,32 +433,75 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 gp_gaussian_mask = visible_gp_offsets[
                     offset_selection_mask
                 ]
-            if gp_gaussian_mask is not None and gp_gaussian_mask.any():
-                # Penalize scale ratio, not raw scale, to avoid covariance
-                # collapse.
-                sorted_scaling = scaling[gp_gaussian_mask].sort(
-                    dim=1
-                ).values
+            scale_mask = (
+                torch.ones(
+                    scaling.shape[0],
+                    dtype=torch.bool,
+                    device=scaling.device,
+                )
+                if opt.gaussianpro_paper_faithful
+                else gp_gaussian_mask
+            )
+            if scale_mask is not None and scale_mask.any():
+                regularized_scaling = scaling[scale_mask]
+                sorted_scaling = regularized_scaling.sort(dim=1).values
                 gaussianpro_flatness_ratio = (
                     sorted_scaling[:, 0]
                     / sorted_scaling[:, 1].clamp_min(1e-8)
                 ).mean()
-                flatness_penalty = (
-                    F.relu(
-                        gaussianpro_flatness_ratio
-                        - opt.gaussianpro_flatness_target
-                    )
-                    + F.relu(
-                        opt.gaussianpro_flatness_floor
-                        - gaussianpro_flatness_ratio
-                    )
-                )
+                # GaussianPro's scale term directly flattens the shortest
+                # covariance axis. The former ratio hinge stopped providing
+                # a gradient well before the plane became thin.
+                minimum_scale_loss = sorted_scaling[:, 0].mean()
                 loss = (
                     loss
                     + opt.lambda_gaussianpro_flatness
-                    * flatness_penalty
+                    * minimum_scale_loss
                 )
-            if iteration % max(1, opt.gaussianpro_feature_interval) == 0:
+
+            if gp_gaussian_mask is not None and gp_gaussian_mask.any():
+                # The Scaffold covariance MLP, rather than the anchor
+                # quaternion, produces the rendered Gaussian orientation.
+                # Explicitly transfer the propagated anchor normal into that
+                # MLP by aligning its predicted minimum-scale axis.
+                target_rotation = gaussians.get_rotation[
+                    voxel_visible_mask
+                ].unsqueeze(1).expand(
+                    -1, gaussians.n_offsets, -1
+                ).reshape(-1, 4)[offset_selection_mask][gp_gaussian_mask]
+                target_normal_world = build_rotation(
+                    target_rotation.detach()
+                )[:, :, 2]
+                predicted_rotation = build_rotation(
+                    generated_rotation[gp_gaussian_mask]
+                )
+                gp_scaling = scaling[gp_gaussian_mask]
+                predicted_min_axis = gp_scaling.argmin(dim=1)
+                predicted_normal_world = predicted_rotation[
+                    torch.arange(
+                        predicted_rotation.shape[0],
+                        device=predicted_rotation.device,
+                    ),
+                    :,
+                    predicted_min_axis,
+                ]
+                anchor_normal_loss = (
+                    1.0
+                    - (
+                        predicted_normal_world * target_normal_world
+                    ).sum(dim=-1).abs().clamp(0.0, 1.0)
+                ).mean()
+                loss = (
+                    loss
+                    + opt.lambda_gaussianpro_anchor_normal
+                    * anchor_normal_loss
+                )
+            if (
+                not opt.gaussianpro_paper_faithful
+                and iteration
+                % max(1, opt.gaussianpro_feature_interval)
+                == 0
+            ):
                 (
                     gaussianpro_feature_l1,
                     gaussianpro_feature_cos,
@@ -640,7 +688,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 scene.save(iteration)
             
             # densification
-            if iteration < opt.update_until and iteration > opt.start_stat:
+            if (
+                iteration < statistics_until_iteration
+                and iteration > opt.start_stat
+            ):
                 # add statis
                 gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask)
                 
@@ -649,17 +700,22 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     scaffold_fallback_step = (
                         opt.use_gaussianpro
                         and opt.gaussianpro_scaffold_fallback
-                        and iteration
-                        % max(
-                            1,
-                            opt.gaussianpro_scaffold_fallback_interval,
+                        and (
+                            opt.gaussianpro_paper_faithful
+                            or iteration
+                            % max(
+                                1,
+                                opt.gaussianpro_scaffold_fallback_interval,
+                            )
+                            == 0
                         )
-                        == 0
                     )
                     if not opt.use_gaussianpro or scaffold_fallback_step:
                         scaffold_added = gaussians.adjust_anchor(
                             check_interval=(
-                                opt.gaussianpro_scaffold_fallback_interval
+                                opt.update_interval
+                                if opt.gaussianpro_paper_faithful
+                                else opt.gaussianpro_scaffold_fallback_interval
                                 if opt.use_gaussianpro
                                 else opt.update_interval
                             ),
@@ -669,7 +725,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                             # active, so fallback only grows image-driven
                             # anchors and cannot bypass its grace period.
                             min_opacity=(
-                                -1.0
+                                opt.min_opacity
+                                if opt.gaussianpro_paper_faithful
+                                else -1.0
                                 if opt.use_gaussianpro
                                 else opt.min_opacity
                             ),
@@ -692,12 +750,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                                 int(gaussians.get_anchor.shape[0]),
                                 gaussianpro_max_anchors,
                             )
-            cleanup_iteration = (
-                opt.gaussianpro_refine_until_iter
-                if gaussianpro is not None
-                else opt.update_until
-            )
-            if iteration == cleanup_iteration:
+            if iteration == statistics_until_iteration:
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
                 del gaussians.offset_denom
@@ -1177,7 +1230,6 @@ if __name__ == "__main__":
 
     if args.gpu != '-1':
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
-        os.system("echo $CUDA_VISIBLE_DEVICES")
         logger.info(f'using GPU {args.gpu}')
 
     
@@ -1217,4 +1269,4 @@ if __name__ == "__main__":
     # All done
     logger.info("\nTraining complete.")
 
-    logger.info("Run render.py and metrics.py separately to render and evaluate the trained model.")
+    logger.info("Run render.py to render the trained model.")

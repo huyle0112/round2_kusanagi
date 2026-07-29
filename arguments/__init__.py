@@ -184,6 +184,7 @@ class OptimizationParams(ParamGroup):
         self.gaussianpro_add_until_iter = 15_000
         self.gaussianpro_refine_until_iter = 24_000
         self.gaussianpro_interval = 50
+        self.gaussianpro_references_per_step = 2
         self.gaussianpro_neighbors = 4
         self.gaussianpro_neighbor_mode = "overlap"
         self.gaussianpro_one_shot_references = False
@@ -229,11 +230,15 @@ class OptimizationParams(ParamGroup):
         self.gaussianpro_scaffold_fallback = True
         self.gaussianpro_scaffold_fallback_interval = 200
 
-        # Geometry supervision stops at refine_until. Flatness is a hinge
-        # target, so ratios below the target are not pushed towards zero.
+        # Propagation/refinement stops at refine_until, while cached planar
+        # supervision remains active through the end of optimization.
+        # The scale term follows GaussianPro by minimizing the shortest axis.
+        # The legacy ratio fields remain CLI-compatible but are not used by
+        # the paper-style scale loss.
         self.gaussianpro_flatness_target = 0.20
         self.gaussianpro_flatness_floor = 0.02
         self.lambda_gaussianpro_flatness = 0.001
+        self.lambda_gaussianpro_anchor_normal = 0.001
         self.lambda_gaussianpro_normal_l1 = 0.001
         self.lambda_gaussianpro_normal_cos = 0.001
         self.lambda_gaussianpro_feature_l1 = 0.0002

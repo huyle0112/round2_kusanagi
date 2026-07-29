@@ -16,8 +16,9 @@ dependencies:
   - tqdm
   - pip:
     - einops
+    - colorama
+    - opencv-python
+    - pillow
     - wandb
-    - lpips
-    - laspy
     - submodules/diff-gaussian-rasterization
     - submodules/simple-knn
