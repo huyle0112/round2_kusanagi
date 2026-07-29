@@ -129,6 +129,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             scene.getTrainCameras(),
             gaussians.get_anchor.detach(),
             num_neighbors=opt.gaussianpro_neighbors,
+            neighbor_mode=(
+                "temporal"
+                if opt.gaussianpro_paper_faithful
+                else opt.gaussianpro_neighbor_mode
+            ),
+            one_shot_references=(
+                opt.gaussianpro_one_shot_references
+                or opt.gaussianpro_paper_faithful
+            ),
             graph_samples=opt.gaussianpro_graph_samples,
             min_overlap=opt.gaussianpro_min_overlap,
             downsample=opt.gaussianpro_downsample,
@@ -137,7 +146,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             opacity_threshold=opt.gaussianpro_opacity_threshold,
             coverage_threshold=opt.gaussianpro_coverage_threshold,
             min_consistent_views=opt.gaussianpro_min_consistent_views,
-            adaptive_views=opt.gaussianpro_adaptive_views,
+            adaptive_views=(
+                opt.gaussianpro_adaptive_views
+                and not opt.gaussianpro_paper_faithful
+            ),
             relaxed_min_views=opt.gaussianpro_relaxed_min_views,
             near_quantile=opt.gaussianpro_near_quantile,
             far_quantile=opt.gaussianpro_far_quantile,
@@ -178,6 +190,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             f"{opt.gaussianpro_refine_until_iter}, "
             f"interval {opt.gaussianpro_interval}, "
             f"downsample {opt.gaussianpro_downsample}, "
+            f"neighbor mode {gaussianpro.neighbor_mode}, "
+            f"one-shot {gaussianpro.one_shot_references}, "
             f"views {opt.gaussianpro_min_consistent_views}->"
             f"{opt.gaussianpro_relaxed_min_views} at depth tails/edge, "
             f"Scaffold fallback "
@@ -232,6 +246,29 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             gaussianpro_allow_add = (
                 iteration < opt.gaussianpro_add_until_iter
             )
+            if (
+                opt.gaussianpro_paper_faithful
+                or opt.gaussianpro_neighbor_mode == "temporal"
+            ):
+                propagation_progress = (
+                    (iteration - opt.gaussianpro_start_iter)
+                    / max(
+                        1,
+                        opt.gaussianpro_add_until_iter
+                        - opt.gaussianpro_start_iter,
+                    )
+                )
+                propagation_progress = min(
+                    1.0, max(0.0, propagation_progress)
+                )
+                gaussianpro.depth_discrepancy_threshold = (
+                    opt.gaussianpro_depth_discrepancy_start
+                    + propagation_progress
+                    * (
+                        opt.gaussianpro_depth_discrepancy_end
+                        - opt.gaussianpro_depth_discrepancy_start
+                    )
+                )
             reference_camera = gaussianpro.next_reference()
             gaussianpro_result, proposed_points, _proposed_normals = (
                 gaussianpro.run(
@@ -788,6 +825,8 @@ def training_report(
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                top_psnr_test = 0.0
+                edge_l1_test = 0.0
                 ssim_test = 0.0
                 lpips_test = 0.0
                 
@@ -815,6 +854,23 @@ def training_report(
 
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    top_rows = max(1, int(image.shape[-2] * 0.20))
+                    top_psnr_test += psnr(
+                        image[:, :top_rows, :],
+                        gt_image[:, :top_rows, :],
+                    ).mean().double()
+                    image_dx = image[:, :, 1:] - image[:, :, :-1]
+                    image_dy = image[:, 1:, :] - image[:, :-1, :]
+                    gt_dx = (
+                        gt_image[:, :, 1:] - gt_image[:, :, :-1]
+                    )
+                    gt_dy = (
+                        gt_image[:, 1:, :] - gt_image[:, :-1, :]
+                    )
+                    edge_l1_test += (
+                        (image_dx - gt_dx).abs().mean()
+                        + (image_dy - gt_dy).abs().mean()
+                    ).double()
                     ssim_test += ssim(image, gt_image).mean().double()
                     lpips_test += lpips_fn(
                         image.unsqueeze(0), gt_image.unsqueeze(0)
@@ -822,6 +878,8 @@ def training_report(
 
                 camera_count = len(config["cameras"])
                 psnr_test /= camera_count
+                top_psnr_test /= camera_count
+                edge_l1_test /= camera_count
                 l1_test /= camera_count
                 ssim_test /= camera_count
                 lpips_test /= camera_count
@@ -836,6 +894,8 @@ def training_report(
                     "photo_loss": float(photo_loss.item()),
                     "l1": float(l1_test.item()),
                     "psnr": float(psnr_test.item()),
+                    "top20_psnr": float(top_psnr_test.item()),
+                    "edge_l1": float(edge_l1_test.item()),
                     "ssim": float(ssim_test.item()),
                     "lpips": float(lpips_test.item()),
                     "anchors": int(scene.gaussians.get_anchor.shape[0]),
@@ -849,6 +909,8 @@ def training_report(
                         "photo_loss",
                         "l1",
                         "psnr",
+                        "top20_psnr",
+                        "edge_l1",
                         "ssim",
                         "lpips",
                         "anchors",
@@ -857,18 +919,22 @@ def training_report(
                 )
                 logger.info(
                     "\n[ITER %d] %s (%d views): loss=%.6f "
-                    "PSNR=%.4f SSIM=%.5f LPIPS=%.5f",
+                    "PSNR=%.4f top20=%.4f edgeL1=%.5f "
+                    "SSIM=%.5f LPIPS=%.5f",
                     iteration,
                     config["name"],
                     camera_count,
                     metrics_row["photo_loss"],
                     metrics_row["psnr"],
+                    metrics_row["top20_psnr"],
+                    metrics_row["edge_l1"],
                     metrics_row["ssim"],
                     metrics_row["lpips"],
                 )
                 if tb_writer:
                     for metric_name in (
-                        "photo_loss", "l1", "psnr", "ssim", "lpips"
+                        "photo_loss", "l1", "psnr", "top20_psnr",
+                        "edge_l1", "ssim", "lpips"
                     ):
                         tb_writer.add_scalar(
                             f"{dataset_name}/{config['name']}/{metric_name}",

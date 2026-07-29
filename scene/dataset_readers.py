@@ -539,7 +539,12 @@ def readCamerasFromCSV(
     return cam_infos
 
 
-def split_train_validation_cameras(cam_infos, validation_ratio=0.2, seed=42):
+def split_train_validation_cameras(
+    cam_infos,
+    validation_ratio=0.2,
+    seed=42,
+    split_mode="random",
+):
     """Deterministically split real cameras while preserving their sorted order."""
     if not 0.0 < validation_ratio < 1.0:
         raise ValueError(
@@ -550,8 +555,25 @@ def split_train_validation_cameras(cam_infos, validation_ratio=0.2, seed=42):
 
     validation_count = int(round(len(cam_infos) * validation_ratio))
     validation_count = min(max(validation_count, 1), len(cam_infos) - 1)
-    rng = random.Random(seed)
-    validation_indices = set(rng.sample(range(len(cam_infos)), validation_count))
+    if split_mode == "random":
+        rng = random.Random(seed)
+        validation_indices = set(
+            rng.sample(range(len(cam_infos)), validation_count)
+        )
+    elif split_mode == "stratified":
+        # One held-out camera near the centre of every temporal/name-order
+        # segment gives much better trajectory coverage than random clusters.
+        validation_indices = {
+            min(
+                len(cam_infos) - 1,
+                int((index + 0.5) * len(cam_infos) / validation_count),
+            )
+            for index in range(validation_count)
+        }
+    else:
+        raise ValueError(
+            "validation_split_mode must be 'random' or 'stratified'"
+        )
     train_cameras = [
         camera for index, camera in enumerate(cam_infos)
         if index not in validation_indices
@@ -571,6 +593,7 @@ def readColmapSceneInfoWithCSV(
     llffhold=8,
     validation_ratio=0.0,
     validation_seed=42,
+    validation_split_mode="random",
     correct_radial_distortion=False,
 ):
     """Extended version of readColmapSceneInfo that loads test cameras from test_poses.csv.
@@ -612,11 +635,13 @@ def readColmapSceneInfoWithCSV(
             cam_infos,
             validation_ratio=validation_ratio,
             seed=validation_seed,
+            split_mode=validation_split_mode,
         )
         print(
             "Validation holdout enabled: "
             f"train={len(train_cam_infos)}, validation={len(test_cam_infos)}, "
-            f"ratio={validation_ratio:.3f}, seed={validation_seed}. "
+            f"ratio={validation_ratio:.3f}, seed={validation_seed}, "
+            f"mode={validation_split_mode}. "
             "Ignoring test_poses.csv for this run."
         )
     elif os.path.exists(csv_path) and eval:

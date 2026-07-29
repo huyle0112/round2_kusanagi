@@ -1,7 +1,8 @@
 """GaussianPro anchor growth adapted to Scaffold-GS.
 
-The implementation follows the main ideas of GaussianPro without assuming
-that input images are temporally ordered:
+The implementation supports both the paper's ordered-video policy and a
+general overlap graph. Paper-faithful mode uses the original temporal offsets
+and processes each reference only once:
 
 * choose source views from a pose/frustum-overlap graph;
 * render low-resolution depth maps for the reference and source views;
@@ -373,6 +374,19 @@ def build_camera_neighbor_graph(
     return graph
 
 
+def build_temporal_neighbor_graph(cameras, offsets=(-2, -1, 1, 2)):
+    """Match GaussianPro's ordered-video source-view policy."""
+    ordered = sorted(cameras, key=lambda camera: camera.image_name)
+    graph = {}
+    for index, reference in enumerate(ordered):
+        graph[reference.image_name] = [
+            ordered[index + offset]
+            for offset in offsets
+            if 0 <= index + offset < len(ordered)
+        ]
+    return graph
+
+
 class GaussianProAnchorBuilder:
     """Runs PatchMatch-style propagation and proposes new Scaffold anchors."""
 
@@ -382,6 +396,8 @@ class GaussianProAnchorBuilder:
         anchor_points,
         *,
         num_neighbors=4,
+        neighbor_mode="overlap",
+        one_shot_references=False,
         graph_samples=4096,
         min_overlap=0.05,
         downsample=8,
@@ -411,13 +427,23 @@ class GaussianProAnchorBuilder:
         self.camera_by_name = {
             camera.image_name: camera for camera in self.cameras
         }
-        self.graph = build_camera_neighbor_graph(
-            self.cameras,
-            anchor_points,
-            num_neighbors=num_neighbors,
-            sample_count=graph_samples,
-            min_overlap=min_overlap,
-        )
+        self.neighbor_mode = str(neighbor_mode).lower()
+        if self.neighbor_mode == "temporal":
+            self.graph = build_temporal_neighbor_graph(self.cameras)
+        elif self.neighbor_mode == "overlap":
+            self.graph = build_camera_neighbor_graph(
+                self.cameras,
+                anchor_points,
+                num_neighbors=num_neighbors,
+                sample_count=graph_samples,
+                min_overlap=min_overlap,
+            )
+        else:
+            raise ValueError(
+                "neighbor_mode must be 'temporal' or 'overlap'"
+            )
+        self.one_shot_references = bool(one_shot_references)
+        self.processed_references = set()
         self.downsample = max(1, int(downsample))
         self.patch_radius = max(0, int(patch_radius))
         self.patchmatch_iterations = max(0, int(patchmatch_iterations))
@@ -965,6 +991,15 @@ class GaussianProAnchorBuilder:
     ):
         result = PropagationResult(reference_camera.image_name)
         self.last_point_confidence = None
+        if (
+            self.one_shot_references
+            and reference_camera.image_name in self.processed_references
+        ):
+            return result, None, None
+        if self.one_shot_references:
+            # The official implementation sets propagation_dict[name] before
+            # running propagation, so a failed reference is not retried.
+            self.processed_references.add(reference_camera.image_name)
         self._ray_cache.clear()
         neighbor_cameras = self.graph.get(reference_camera.image_name, [])
         minimum_required = (
@@ -1109,10 +1144,21 @@ class GaussianProAnchorBuilder:
         under_covered = (
             reference["opacity"][0] < self.coverage_threshold
         )
-        needs_anchor = (
-            under_covered
-            | (relative_difference >= self.depth_discrepancy_threshold)
-        )
+        if self.neighbor_mode == "temporal":
+            # Official GaussianPro initializes new Gaussians only where
+            # propagated and rendered depths disagree beyond the scheduled
+            # relative-depth threshold.
+            needs_anchor = (
+                relative_difference >= self.depth_discrepancy_threshold
+            )
+        else:
+            needs_anchor = (
+                under_covered
+                | (
+                    relative_difference
+                    >= self.depth_discrepancy_threshold
+                )
+            )
         border_valid = torch.ones_like(photo_mask)
         if self.patch_radius > 0:
             border_valid[: self.patch_radius] = False
@@ -1120,7 +1166,7 @@ class GaussianProAnchorBuilder:
             border_valid[:, : self.patch_radius] = False
             border_valid[:, -self.patch_radius :] = False
         accepted = photo_mask & geometry_mask & normal_valid & border_valid
-        if require_new_anchor:
+        if require_new_anchor or self.neighbor_mode == "temporal":
             accepted = accepted & needs_anchor
 
         accepted_indices = accepted.flatten().nonzero().squeeze(1)

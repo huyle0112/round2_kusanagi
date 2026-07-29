@@ -68,6 +68,7 @@ class ModelParams(ParamGroup):
         # validation/ablation runs with ground truth.
         self.validation_ratio = 0.0
         self.validation_seed = 42
+        self.validation_split_mode = "random"
         # When validation_ratio is zero, metrics can still be monitored on a
         # deterministic sample of training cameras without withholding them.
         # A value of zero disables this proxy-validation mode.
@@ -178,11 +179,14 @@ class OptimizationParams(ParamGroup):
         # multi-view geometry throughout training while Scaffold-GS continues
         # to optimize and prune the resulting anchors.
         self.use_gaussianpro = False
+        self.gaussianpro_paper_faithful = False
         self.gaussianpro_start_iter = 3000
         self.gaussianpro_add_until_iter = 15_000
         self.gaussianpro_refine_until_iter = 24_000
         self.gaussianpro_interval = 50
         self.gaussianpro_neighbors = 4
+        self.gaussianpro_neighbor_mode = "overlap"
+        self.gaussianpro_one_shot_references = False
         self.gaussianpro_graph_samples = 4096
         self.gaussianpro_min_overlap = 0.05
         self.gaussianpro_downsample = 4
@@ -203,6 +207,8 @@ class OptimizationParams(ParamGroup):
         self.gaussianpro_depth_consistency_threshold = 0.03
         self.gaussianpro_normal_consistency_threshold = 0.5
         self.gaussianpro_depth_discrepancy_threshold = 0.20
+        self.gaussianpro_depth_discrepancy_start = 1.0
+        self.gaussianpro_depth_discrepancy_end = 0.8
         self.gaussianpro_edge_residual_priority = 0.5
         self.gaussianpro_max_anchors_per_step = 128
         self.gaussianpro_voxel_factor = 1.0

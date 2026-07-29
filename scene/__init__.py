@@ -56,6 +56,9 @@ class Scene:
                 args.lod,
                 validation_ratio=getattr(args, "validation_ratio", 0.0),
                 validation_seed=getattr(args, "validation_seed", 42),
+                validation_split_mode=getattr(
+                    args, "validation_split_mode", "random"
+                ),
                 correct_radial_distortion=getattr(
                     args, "correct_radial_distortion", False
                 ),

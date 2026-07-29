@@ -1,7 +1,7 @@
 {
   "id": "acomingz/gaussianpro-sharp-full-dataset",
-  "title": "GaussianPro Sharp Full Dataset 30k",
-  "code_file": "kaggle_gaussianpro_sharp_filter_30k.ipynb",
+  "title": "GaussianPro HCM0421 Validation Tuning 90-10",
+  "code_file": "kaggle_validate_tune_hcm0421_90_10.ipynb",
   "language": "python",
   "kernel_type": "notebook",
   "is_private": true,
